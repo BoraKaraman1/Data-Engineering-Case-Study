@@ -25,6 +25,8 @@ type Metrics struct {
 	RedisWrite        *prometheus.HistogramVec
 	CleanProduce      prometheus.Histogram
 	AnalyticsBatch    prometheus.Histogram
+	RealtimeBatch     prometheus.Histogram
+	RealtimeFlush     *prometheus.CounterVec
 	ConsumerLag       *prometheus.GaugeVec
 }
 
@@ -86,6 +88,15 @@ func NewMetrics() *Metrics {
 			Help:    "Messages per analytics flush (size-or-time batch); confirms H1 batching.",
 			Buckets: []float64{1, 5, 10, 25, 50, 100, 200, 350, 500, 750, 1000},
 		}),
+		RealtimeBatch: promauto.NewHistogram(prometheus.HistogramOpts{
+			Name:    "processor_realtime_batch_size",
+			Help:    "Messages per realtime current-state flush (size-or-time batch); confirms H2 batching.",
+			Buckets: []float64{1, 5, 10, 25, 50, 100, 200, 350, 500, 750, 1000},
+		}),
+		RealtimeFlush: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "processor_realtime_flush_total",
+			Help: "Realtime batch flushes by trigger: size (hit N messages) or timer (hit T ms first).",
+		}, []string{"reason"}),
 		ConsumerLag: promauto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "processor_consumer_lag",
 			Help: "Best-effort consumer lag per group from kafka-go reader stats.",

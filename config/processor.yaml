@@ -35,3 +35,15 @@ analytics:
   flush_ms:   100                    # ...or after this long since the batch's first message,
                                      # whichever comes first. Amortises the Redis EXISTS/SET,
                                      # clean produce, and offset commit over the whole batch (H1).
+
+realtime:
+  batch_max_messages: 750            # N: flush the current-state CAS after this many messages
+  batch_max_wait_ms:  25             # T: ...or this long since the batch's first message,
+                                     # whichever comes first. min(N,T): under load N fires first
+                                     # (T never trips -> low latency); under a trickle T fires so
+                                     # an open batch flushes within T rather than waiting to reach
+                                     # N. N caps tail latency (one fetch can't hand a worker a slug
+                                     # so large its last event blows the <1s freshness budget); T
+                                     # is the low-load client-side floor. Applies the CAS across
+                                     # the batch in ONE pipelined round trip, lifting the per-event
+                                     # Redis-RTT ceiling (H2).

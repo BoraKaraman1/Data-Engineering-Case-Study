@@ -55,15 +55,21 @@ func deriveStatus(e transform.Event) string {
 	return ""
 }
 
-// Apply writes the connector's current state from this event. Returns false when the
-// event is stale (older than what's stored) and was therefore skipped.
-func (s *StateStore) Apply(ctx context.Context, e transform.Event, ts time.Time) (bool, error) {
-	key := stateKey(e.StationID, e.ConnectorID)
+// stateEvent is one decoded, validated event awaiting a batched current-state write, paired
+// with its parsed event time (the CAS last_seen comparand). ApplyBatch preserves input
+// (offset) order so the newest event per connector wins the CAS.
+type stateEvent struct {
+	e  transform.Event
+	ts time.Time
+}
 
-	// Only the fields this event actually knows about, so a STATUS_CHANGE never clobbers
-	// the last known power/soc with zeros. ARGV[1]=event ms, ARGV[2]=ttl ms, ARGV[3..]
-	// are the field/value pairs.
-	args := []any{ts.UnixMilli(), s.ttl.Milliseconds()}
+// stateArgs builds the casScript arguments for one event: ARGV[1]=event ms, ARGV[2]=ttl ms,
+// then ONLY the fields this event actually knows about, so a STATUS_CHANGE never clobbers the
+// last known power/soc with zeros (status only from STATUS_CHANGE, meter only when present,
+// SESSION_STOP clears session and power). Shared by Apply and ApplyBatch so the single-event
+// and batched paths build byte-for-byte identical CAS writes.
+func stateArgs(e transform.Event, ts time.Time, ttl time.Duration) []any {
+	args := []any{ts.UnixMilli(), ttl.Milliseconds()}
 	if st := deriveStatus(e); st != "" {
 		args = append(args, "status", st)
 	}
@@ -78,10 +84,52 @@ func (s *StateStore) Apply(ctx context.Context, e transform.Event, ts time.Time)
 	case "SESSION_STOP":
 		args = append(args, "session", "", "power", 0)
 	}
+	return args
+}
 
-	res, err := casScript.Run(ctx, s.rdb, []string{key}, args...).Int()
+// Apply writes the connector's current state from this event. Returns false when the
+// event is stale (older than what's stored) and was therefore skipped.
+func (s *StateStore) Apply(ctx context.Context, e transform.Event, ts time.Time) (bool, error) {
+	key := stateKey(e.StationID, e.ConnectorID)
+	res, err := casScript.Run(ctx, s.rdb, []string{key}, stateArgs(e, ts, s.ttl)...).Int()
 	if err != nil {
 		return false, err
 	}
 	return res == 1, nil
+}
+
+// ApplyBatch writes the current state for a whole batch of events in ONE pipelined round
+// trip. It runs the SAME casScript per event -- so the older-than-last_seen rejection, the
+// field-selective HSET, and the TTL refresh are byte-for-byte the per-event Apply semantics
+// -- but pipelines them so the batch pays a single Redis RTT instead of one per event, which
+// is what lifts the realtime path off its per-event-round-trip ceiling (H2). Events MUST be
+// in offset (arrival) order: same-station events share one partition and one worker, so a
+// connector's events stay ordered here and the CAS keeps its newest state. Returns, per event
+// and in input order, whether the write applied (true) or was skipped as stale (false).
+//
+// Eval (not EvalSha/Run) is used inside the pipeline so a cold script cache can never surface
+// a NOSCRIPT mid-pipeline: the whole batch is still ONE round trip, and the bottleneck was the
+// RTT, not the ~200-byte script text carried in it.
+func (s *StateStore) ApplyBatch(ctx context.Context, events []stateEvent) ([]bool, error) {
+	if len(events) == 0 {
+		return nil, nil
+	}
+	pipe := s.rdb.Pipeline()
+	cmds := make([]*redis.Cmd, len(events))
+	for i := range events {
+		key := stateKey(events[i].e.StationID, events[i].e.ConnectorID)
+		cmds[i] = casScript.Eval(ctx, pipe, []string{key}, stateArgs(events[i].e, events[i].ts, s.ttl)...)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return nil, err
+	}
+	applied := make([]bool, len(events))
+	for i, c := range cmds {
+		n, err := c.Int()
+		if err != nil {
+			return nil, err
+		}
+		applied[i] = n == 1
+	}
+	return applied, nil
 }

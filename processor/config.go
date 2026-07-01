@@ -17,6 +17,7 @@ type Config struct {
 	Metrics   MetricsConfig   `yaml:"metrics"`
 	Workers   WorkersConfig   `yaml:"workers"`
 	Analytics AnalyticsConfig `yaml:"analytics"`
+	Realtime  RealtimeConfig  `yaml:"realtime"`
 }
 
 type KafkaConfig struct {
@@ -61,6 +62,14 @@ type AnalyticsConfig struct {
 	FlushMs   int `yaml:"flush_ms"`
 }
 
+// RealtimeConfig is the bounded opportunistic micro-batch for the current-state path:
+// flush the CAS pipeline after BatchMaxMessages (N) accumulate OR BatchMaxWaitMs (T)
+// elapses since the batch's first message, whichever comes first.
+type RealtimeConfig struct {
+	BatchMaxMessages int `yaml:"batch_max_messages"`
+	BatchMaxWaitMs   int `yaml:"batch_max_wait_ms"`
+}
+
 // LoadConfig reads and parses the YAML config, filling in sane defaults.
 func LoadConfig(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
@@ -94,6 +103,12 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if c.Analytics.FlushMs <= 0 {
 		c.Analytics.FlushMs = 100
+	}
+	if c.Realtime.BatchMaxMessages <= 0 {
+		c.Realtime.BatchMaxMessages = 750
+	}
+	if c.Realtime.BatchMaxWaitMs <= 0 {
+		c.Realtime.BatchMaxWaitMs = 25
 	}
 	if c.Metrics.Listen == "" {
 		c.Metrics.Listen = ":9102"

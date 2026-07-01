@@ -184,10 +184,11 @@ measuring the pipeline.
 `registry-seed` → `simulator` → `processor` for the new roster, then records produced vs
 clean throughput, transport-lag percentiles, authoritative Redpanda consumer-group lag,
 and A1/A4 query latency to **`benchmarks/results.csv`** (the per-message baseline in the
-first four rows, the batched analytics build (H1) in the last four). The measured curve and
-the bottleneck analysis (the analytics produce/commit ceiling, now batched so `clean_eps`
-clears 100k, with the unchanged realtime path still capped above ~10k, plus the path to
-100k) are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §11.
+first four rows, the batched build in the last four). The measured curve and the bottleneck
+analysis (the analytics produce/commit ceiling batched in H1 so `clean_eps` clears 100k, and
+the realtime per-event Redis round-trip batched in H2 so `realtime_lag` stays bounded and
+current-state freshness holds `<1 s` through 50k, plus the path to 100k) are in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §11.
 
 ---
 

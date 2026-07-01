@@ -59,13 +59,14 @@ func main() {
 
 	log.Printf("starting groups: realtime=%d analytics=%d on %q",
 		cfg.Workers.Realtime, cfg.Workers.Analytics, cfg.Kafka.TopicRaw)
-	log.Printf("analytics batching: batch_size=%d flush_ms=%d",
-		cfg.Analytics.BatchSize, cfg.Analytics.FlushMs)
+	log.Printf("analytics batching: batch_size=%d flush_ms=%d", cfg.Analytics.BatchSize, cfg.Analytics.FlushMs)
+	log.Printf("realtime batching: batch_max_messages=%d batch_max_wait_ms=%d",
+		cfg.Realtime.BatchMaxMessages, cfg.Realtime.BatchMaxWaitMs)
 
 	var wg sync.WaitGroup
-	runGroup(ctx, &wg, cfg, m, groupSpec{
+	runRealtimeBatchGroup(ctx, &wg, cfg, m, realtimeBatchSpec{
 		name: "realtime", groupID: cfg.Kafka.GroupRealtime,
-		workers: cfg.Workers.Realtime, handle: rt.handle,
+		workers: cfg.Workers.Realtime, apply: rt.applyBatch,
 	})
 	runAnalyticsBatchGroup(ctx, &wg, cfg, m, batchGroupSpec{
 		name: "analytics", groupID: cfg.Kafka.GroupAnalytics,
