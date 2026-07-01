@@ -1,0 +1,23 @@
+# Go
+simulator/simulator
+processor/processor
+*.test
+*.out
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# env / local
+.env
+*.log
+
+# data dumps from load tests
+CS_Data Engineer_Case Study.pdf
+context.md
+CLAUDE.md
+.claude/
+.mcp.json

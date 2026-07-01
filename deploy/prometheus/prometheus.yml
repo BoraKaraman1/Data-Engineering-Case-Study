@@ -1,0 +1,25 @@
+# Prometheus scrapes the pipeline components:
+#   simulator  - produced-event counters
+#   processor  - throughput, ingestion/transport lag, DLQ, dedup, store-write latency
+#   redpanda   - AUTHORITATIVE Kafka consumer-group lag (per group) + broker health
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: simulator
+    static_configs:
+      - targets: ["simulator:9101"]
+
+  - job_name: processor
+    static_configs:
+      - targets: ["processor:9102"]
+
+  # Redpanda exposes Prometheus metrics on its admin port. /public_metrics includes
+  # redpanda_kafka_consumer_group_lag_sum - the authoritative consumer-group lag the ops
+  # dashboard uses (the processor's own lag gauge is best-effort only, so we don't rely
+  # on it). This is the fix for "group-reader lag is unreliable in kafka-go".
+  - job_name: redpanda
+    metrics_path: /public_metrics
+    static_configs:
+      - targets: ["redpanda:9644"]
