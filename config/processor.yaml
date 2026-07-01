@@ -1,0 +1,31 @@
+kafka:
+  brokers: ["redpanda:9092"]
+  topic_raw:   "charging-events-raw"
+  topic_clean: "charging-events-clean"
+  topic_dlq:   "charging-events-dlq"
+  group_realtime:  "realtime"        # latency-first consumer group -> Redis current state
+  group_analytics: "analytics"       # throughput-first group -> dedup -> clean topic
+  batch_size: 1000                   # clean writer coalesces concurrent writes into batches
+  linger_ms:  5                      # at low concurrency each worker waits ~1 linger per produce,
+                                     # so keep it small; at high volume batches fill by size first
+
+redis:
+  addr: "redis:6379"
+
+postgres:
+  dsn: "postgres://chargesquare:chargesquare@postgres:5432/chargesquare?sslmode=disable"
+
+dedup:
+  ttl_sec: 120                       # sized to the redelivery window; ClickHouse catches later dups
+
+state:
+  ttl_sec: 300                       # "current status = last 5 min": key exists iff seen within 5 min
+                                     # (safe: active connectors emit every <=30s, far under 300s)
+
+metrics:
+  listen: ":9102"
+  pprof:  true                       # /debug/pprof for Phase-4 profiling; LOCAL-ONLY, disable in prod
+
+workers:
+  realtime:  4                       # readers per group; parallelism caps at the 12 raw partitions
+  analytics: 12                      # one reader per partition; each blocks on a synchronous produce
