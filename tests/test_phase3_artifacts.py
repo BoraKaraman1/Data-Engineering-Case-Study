@@ -83,7 +83,9 @@ class Phase3ArtifactsTest(unittest.TestCase):
         self.assertIn("cost_eur", sql)
         self.assertIn("tariff_id", sql)
         self.assertRegex(sql, r"(operator_id|city)")
-        self.assertRegex(sql, r"(7|07).*(9|09)|(17).*(20)")
+        # Peak is the rate the simulator actually billed (is_peak_priced on SESSION_STOP),
+        # not a wall-clock hour window re-derived downstream (H3).
+        self.assertIn("is_peak_priced", sql)
         self.assertRegex(sql, r"(peak|tohour|extract\s*\(\s*hour)")
 
     def test_a5_fault_geography_is_deduped(self):

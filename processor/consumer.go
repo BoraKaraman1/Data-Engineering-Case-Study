@@ -19,6 +19,16 @@ type groupSpec struct {
 	handle  func(ctx context.Context, m kafka.Message) error
 }
 
+// batchGroupSpec is the batched analog of groupSpec: flush handles a whole slice of
+// messages at once and returns nil to commit them all, or an error to leave the batch
+// uncommitted (redelivered).
+type batchGroupSpec struct {
+	name    string
+	groupID string
+	workers int
+	flush   func(ctx context.Context, batch []kafka.Message) error
+}
+
 func newReader(cfg *Config, groupID string) *kafka.Reader {
 	return kafka.NewReader(kafka.ReaderConfig{
 		Brokers:        cfg.Kafka.Brokers,
@@ -67,6 +77,75 @@ func runGroup(ctx context.Context, wg *sync.WaitGroup, cfg *Config, m *Metrics, 
 					log.Printf("[%s] commit: %v", spec.name, cerr)
 				}
 				cancel()
+			}
+		}()
+	}
+}
+
+// runAnalyticsBatchGroup is the batched variant of runGroup for the analytics group. Each
+// reader accumulates FetchMessage'd messages until the batch reaches cfg.Analytics.BatchSize
+// OR cfg.Analytics.FlushMs elapses since the batch's first message, flushes the batch
+// through spec.flush, and commits the whole batch's offsets on success. This amortises the
+// per-event Redis/produce/commit round-trips that capped the per-message path (H1). The
+// realtime group keeps runGroup unchanged.
+func runAnalyticsBatchGroup(ctx context.Context, wg *sync.WaitGroup, cfg *Config, m *Metrics, spec batchGroupSpec) {
+	size := cfg.Analytics.BatchSize
+	window := time.Duration(cfg.Analytics.FlushMs) * time.Millisecond
+	for i := 0; i < spec.workers; i++ {
+		wg.Add(1)
+		pollLagHere := i == 0 // one lag poller per group is enough (best-effort)
+		go func() {
+			defer wg.Done()
+			r := newReader(cfg, spec.groupID)
+			defer func() { r.Close() }()
+			if pollLagHere {
+				go pollLag(ctx, r, m, spec.name)
+			}
+			batch := make([]kafka.Message, 0, size)
+			for {
+				// Block for the first message on the parent context; the flush window is
+				// measured from its arrival.
+				first, err := r.FetchMessage(ctx)
+				if err != nil {
+					if ctx.Err() != nil {
+						return // shutting down
+					}
+					log.Printf("[%s] fetch: %v", spec.name, err)
+					time.Sleep(200 * time.Millisecond)
+					continue
+				}
+				batch = append(batch[:0], first)
+
+				// Fill until the batch is full or the flush window elapses (a fetch on the
+				// deadline'd context returns an error, which just ends accumulation).
+				fctx, fcancel := context.WithDeadline(ctx, time.Now().Add(window))
+				for len(batch) < size {
+					msg, ferr := r.FetchMessage(fctx)
+					if ferr != nil {
+						break
+					}
+					batch = append(batch, msg)
+				}
+				fcancel()
+
+				// Flush + commit on a background context so an in-hand batch finishes even
+				// during shutdown (no produced-but-uncommitted gap).
+				pctx, pcancel := context.WithTimeout(context.Background(), 30*time.Second)
+				if herr := spec.flush(pctx, batch); herr != nil {
+					log.Printf("[%s] flush: %v", spec.name, herr)
+					pcancel()
+					// Uncommitted: rejoin from the last commit so the batch is redelivered
+					// (kafka-go only redelivers uncommitted offsets on a new generation),
+					// then retry. Only a durable-produce failure reaches here.
+					r.Close()
+					r = newReader(cfg, spec.groupID)
+					time.Sleep(200 * time.Millisecond)
+					continue
+				}
+				if cerr := r.CommitMessages(pctx, batch...); cerr != nil {
+					log.Printf("[%s] commit: %v", spec.name, cerr)
+				}
+				pcancel()
 			}
 		}()
 	}

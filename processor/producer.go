@@ -21,28 +21,45 @@ type Writers struct {
 }
 
 func NewWriters(cfg *Config) *Writers {
-	mk := func(topic string) *kafka.Writer {
+	mk := func(topic string, batchSize int) *kafka.Writer {
 		return &kafka.Writer{
 			Addr:         kafka.TCP(cfg.Kafka.Brokers...),
 			Topic:        topic,
 			Balancer:     &kafka.Hash{}, // key=station_id -> per-station order into ClickHouse
-			BatchSize:    cfg.Kafka.BatchSize,
+			BatchSize:    batchSize,
 			BatchTimeout: time.Duration(cfg.Kafka.LingerMs) * time.Millisecond,
 			RequiredAcks: kafka.RequireAll,
 			Async:        false,
 			Compression:  kafka.Snappy,
 		}
 	}
-	return &Writers{clean: mk(cfg.Kafka.TopicClean), dlq: mk(cfg.Kafka.TopicDLQ)}
+	// The analytics path hands the clean writer a whole batch per flush, so its BatchSize
+	// must be >= analytics.batch_size or kafka-go would split one flush across several
+	// produce requests; the DLQ stays at the base size (rejects are the rare path).
+	cleanBatch := cfg.Kafka.BatchSize
+	if cfg.Analytics.BatchSize > cleanBatch {
+		cleanBatch = cfg.Analytics.BatchSize
+	}
+	return &Writers{clean: mk(cfg.Kafka.TopicClean, cleanBatch), dlq: mk(cfg.Kafka.TopicDLQ, cfg.Kafka.BatchSize)}
 }
 
-// WriteClean publishes a flattened event to the clean topic, keyed by station_id.
-func (w *Writers) WriteClean(ctx context.Context, ce transform.CleanEvent) error {
-	b, err := json.Marshal(ce)
-	if err != nil {
-		return err
+// WriteCleanBatch publishes a batch of flattened events to the clean topic (keyed by
+// station_id) in one synchronous, RequireAll WriteMessages call. It is all-or-nothing: on
+// error the caller must NOT Mark or commit, so the whole batch replays and ClickHouse's
+// ReplacingMergeTree collapses the re-produced duplicates.
+func (w *Writers) WriteCleanBatch(ctx context.Context, events []transform.CleanEvent) error {
+	if len(events) == 0 {
+		return nil
 	}
-	return w.clean.WriteMessages(ctx, kafka.Message{Key: []byte(ce.StationID), Value: b})
+	msgs := make([]kafka.Message, len(events))
+	for i := range events {
+		b, err := json.Marshal(events[i])
+		if err != nil {
+			return err
+		}
+		msgs[i] = kafka.Message{Key: []byte(events[i].StationID), Value: b}
+	}
+	return w.clean.WriteMessages(ctx, msgs...)
 }
 
 type dlqRecord struct {
@@ -51,19 +68,37 @@ type dlqRecord struct {
 	IngestedAt string `json:"ingested_at"`
 }
 
-// WriteDLQ publishes a rejected payload with the reason and processing time. The key is
-// the raw message key (station_id), which is available even when the payload won't parse.
-func (w *Writers) WriteDLQ(ctx context.Context, key, raw []byte, errStr string, ingestedAt time.Time) error {
-	rec := dlqRecord{
-		RawPayload: string(raw),
-		Error:      errStr,
-		IngestedAt: ingestedAt.UTC().Format(transform.TimeLayout),
+// dlqItem is one rejected message queued for a batched dead-letter write. Rule is the
+// machine label for the metrics (processor_dlq_total / _validation_errors_total); it is
+// not serialised into the dead-letter record.
+type dlqItem struct {
+	Key   []byte
+	Raw   []byte
+	Rule  string
+	Error string
+}
+
+// WriteDLQBatch publishes a batch of rejected payloads in one synchronous, RequireAll
+// call, each keyed by its raw station_id (available even when the payload won't parse) and
+// stamped with the shared processing time. Same all-or-nothing contract as the clean path.
+func (w *Writers) WriteDLQBatch(ctx context.Context, items []dlqItem, ingestedAt time.Time) error {
+	if len(items) == 0 {
+		return nil
 	}
-	b, err := json.Marshal(rec)
-	if err != nil {
-		return err
+	ts := ingestedAt.UTC().Format(transform.TimeLayout)
+	msgs := make([]kafka.Message, len(items))
+	for i := range items {
+		b, err := json.Marshal(dlqRecord{
+			RawPayload: string(items[i].Raw),
+			Error:      items[i].Error,
+			IngestedAt: ts,
+		})
+		if err != nil {
+			return err
+		}
+		msgs[i] = kafka.Message{Key: items[i].Key, Value: b}
 	}
-	return w.dlq.WriteMessages(ctx, kafka.Message{Key: key, Value: b})
+	return w.dlq.WriteMessages(ctx, msgs...)
 }
 
 func (w *Writers) Close() error {

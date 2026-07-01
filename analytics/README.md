@@ -11,8 +11,9 @@ runnable against the live ClickHouse.
     sums; window anchored to the latest event-time, not wall-clock `now()`)
   - **A2** station uptime / downtime ratio per operator, from the STATUS_CHANGE timeline
   - **A3** average session duration + energy by vehicle brand
-  - **A4** revenue broken down by operator × city × tariff, with peak-hour share
-    (tariff × energy × time-of-day)
+  - **A4** revenue broken down by operator × city × tariff, with peak-rate share
+    (tariff × energy × time-of-day) taken from the billed `is_peak_priced` flag,
+    not a re-derived clock hour
   - **A5** geographic distribution of FAULT events, deduped by `event_id`
   - **A6** anomaly detection: sessions whose average power is > 2σ above the fleet mean
     (bonus)
@@ -41,6 +42,10 @@ runs from the repo root or from `analytics/`; override the target with `CLICKHOU
 - **Event-time windows.** The simulator runs with `time_acceleration > 1`, so the event
   clock runs ahead of wall time. Time-windowed queries (A1/A4/A5) anchor to
   `max(timestamp)` in the data rather than `now()`, which would clip the window.
+- **Peak = billed, not derived.** A4's peak revenue comes from an `is_peak_priced` flag
+  the simulator sets when it applies the peak multiplier, carried through to the clean
+  row — so peak contribution matches what was charged, not a downstream clock-hour guess.
+  See `../docs/ARCHITECTURE.md` §10.
 
 Only the revenue rollup (`deploy/clickhouse/init/02_aggregates.sql`) is a streaming
 materialized view; A1/A2/A3/A5/A6 are query-time exact analytics because they need

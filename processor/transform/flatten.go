@@ -37,20 +37,21 @@ type Fault struct {
 }
 
 type Event struct {
-	EventID     string   `json:"event_id"`
-	EventType   string   `json:"event_type"`
-	StationID   string   `json:"station_id"`
-	ConnectorID int      `json:"connector_id"`
-	SessionID   string   `json:"session_id,omitempty"`
-	Timestamp   string   `json:"timestamp"`
-	OperatorID  string   `json:"operator_id"`
-	Location    Location `json:"location"`
-	Meter       *Meter   `json:"meter,omitempty"`
-	Vehicle     *Vehicle `json:"vehicle,omitempty"`
-	TariffID    string   `json:"tariff_id,omitempty"`
-	CostEur     float64  `json:"cost_eur,omitempty"`
-	Fault       *Fault   `json:"fault,omitempty"`
-	Status      string   `json:"status,omitempty"`
+	EventID      string   `json:"event_id"`
+	EventType    string   `json:"event_type"`
+	StationID    string   `json:"station_id"`
+	ConnectorID  int      `json:"connector_id"`
+	SessionID    string   `json:"session_id,omitempty"`
+	Timestamp    string   `json:"timestamp"`
+	OperatorID   string   `json:"operator_id"`
+	Location     Location `json:"location"`
+	Meter        *Meter   `json:"meter,omitempty"`
+	Vehicle      *Vehicle `json:"vehicle,omitempty"`
+	TariffID     string   `json:"tariff_id,omitempty"`
+	CostEur      float64  `json:"cost_eur,omitempty"`
+	Fault        *Fault   `json:"fault,omitempty"`
+	Status       string   `json:"status,omitempty"`
+	IsPeakPriced bool     `json:"is_peak_priced"`
 }
 
 // ---------------------------------------------------------------------------
@@ -85,6 +86,7 @@ type CleanEvent struct {
 	ErrorCode    string  `json:"error_code"`
 	Component    string  `json:"component"`
 	Status       string  `json:"status"`
+	IsPeakPriced uint8   `json:"is_peak_priced"`
 }
 
 // Flatten lifts the nested sub-objects into the flat analytics row and stamps the
@@ -107,6 +109,9 @@ func Flatten(e Event, ingestedAt time.Time) CleanEvent {
 		TariffID:    e.TariffID,
 		CostEur:     e.CostEur,
 		Status:      e.Status,
+	}
+	if e.IsPeakPriced {
+		ce.IsPeakPriced = 1
 	}
 	if e.Meter != nil {
 		ce.PowerKW = e.Meter.PowerKW

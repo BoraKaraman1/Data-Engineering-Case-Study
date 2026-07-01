@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS ev.events_queue
     cost_eur      Float32,
     error_code    LowCardinality(String),
     component     LowCardinality(String),
-    status        LowCardinality(String)
+    status        LowCardinality(String),
+    is_peak_priced UInt8
 )
 ENGINE = Kafka
 SETTINGS
@@ -98,7 +99,8 @@ CREATE TABLE IF NOT EXISTS ev.events_raw
     cost_eur      Float32,
     error_code    LowCardinality(String),
     component     LowCardinality(String),
-    status        LowCardinality(String)
+    status        LowCardinality(String),
+    is_peak_priced UInt8 DEFAULT 0
 )
 ENGINE = ReplacingMergeTree(ingested_at)
 PARTITION BY toYYYYMM(timestamp)
@@ -115,7 +117,7 @@ SELECT
     timestamp, ingested_at, operator_id, lat, lon, city, country,
     power_kw, energy_kwh, voltage_v, current_a, soc_percent,
     vehicle_brand, vehicle_model, ev_id, tariff_id, cost_eur,
-    error_code, component, status
+    error_code, component, status, is_peak_priced
 FROM ev.events_queue;
 
 -- ---------------------------------------------------------------------------

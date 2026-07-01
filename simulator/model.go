@@ -43,20 +43,21 @@ type Fault struct {
 }
 
 type Event struct {
-	EventID     string   `json:"event_id"`
-	EventType   string   `json:"event_type"`
-	StationID   string   `json:"station_id"`
-	ConnectorID int      `json:"connector_id"`
-	SessionID   string   `json:"session_id,omitempty"`
-	Timestamp   string   `json:"timestamp"` // RFC3339 with milliseconds, UTC
-	OperatorID  string   `json:"operator_id"`
-	Location    Location `json:"location"`
-	Meter       *Meter   `json:"meter,omitempty"`
-	Vehicle     *Vehicle `json:"vehicle,omitempty"`
-	TariffID    string   `json:"tariff_id,omitempty"`
-	CostEur     float64  `json:"cost_eur,omitempty"`
-	Fault       *Fault   `json:"fault,omitempty"`
-	Status      string   `json:"status,omitempty"` // new connector status on STATUS_CHANGE
+	EventID      string   `json:"event_id"`
+	EventType    string   `json:"event_type"`
+	StationID    string   `json:"station_id"`
+	ConnectorID  int      `json:"connector_id"`
+	SessionID    string   `json:"session_id,omitempty"`
+	Timestamp    string   `json:"timestamp"` // RFC3339 with milliseconds, UTC
+	OperatorID   string   `json:"operator_id"`
+	Location     Location `json:"location"`
+	Meter        *Meter   `json:"meter,omitempty"`
+	Vehicle      *Vehicle `json:"vehicle,omitempty"`
+	TariffID     string   `json:"tariff_id,omitempty"`
+	CostEur      float64  `json:"cost_eur,omitempty"`
+	Fault        *Fault   `json:"fault,omitempty"`
+	Status       string   `json:"status,omitempty"`         // new connector status on STATUS_CHANGE
+	IsPeakPriced bool     `json:"is_peak_priced,omitempty"` // SESSION_STOP billed at the peak multiplier (analytics-only)
 }
 
 const (
@@ -370,8 +371,10 @@ func (st *Station) stopSession(conn *Connector, now time.Time) Event {
 	s := conn.session
 	price := tariffPrices[s.TariffID]
 	rate := price.base
+	peakPriced := false
 	if h := now.Hour(); h >= 17 && h < 21 {
 		rate = price.base * price.peak
+		peakPriced = true
 	}
 	cost := s.EnergyKWh * rate
 
@@ -379,6 +382,7 @@ func (st *Station) stopSession(conn *Connector, now time.Time) Event {
 	e.SessionID = s.ID
 	e.TariffID = s.TariffID
 	e.CostEur = round2(cost)
+	e.IsPeakPriced = peakPriced
 	e.Meter = &Meter{
 		PowerKW: 0, EnergyKWh: round3(s.EnergyKWh),
 		VoltageV: nominalVoltage(conn), CurrentA: 0, SocPercent: int(s.Soc),

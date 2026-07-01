@@ -25,13 +25,40 @@ func NewDeduper(rdb *redis.Client, ttl time.Duration) *Deduper {
 
 func dedupKey(eventID string) string { return "dedup:" + eventID }
 
-// Seen reports whether this event_id was already marked within the TTL window.
-func (d *Deduper) Seen(ctx context.Context, eventID string) (bool, error) {
-	n, err := d.rdb.Exists(ctx, dedupKey(eventID)).Result()
-	return n > 0, err
+// SeenBatch reports, per event_id and in input order, whether it was already marked within
+// the TTL window. It issues one pipelined EXISTS round-trip for the whole slice, so the
+// batch pays a single Redis RTT instead of one per event. Fails as a unit: on a pipeline
+// error the caller treats every id as not-seen (fail open -- ClickHouse is the authority).
+func (d *Deduper) SeenBatch(ctx context.Context, eventIDs []string) ([]bool, error) {
+	if len(eventIDs) == 0 {
+		return nil, nil
+	}
+	pipe := d.rdb.Pipeline()
+	cmds := make([]*redis.IntCmd, len(eventIDs))
+	for i, id := range eventIDs {
+		cmds[i] = pipe.Exists(ctx, dedupKey(id))
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return nil, err
+	}
+	seen := make([]bool, len(eventIDs))
+	for i, c := range cmds {
+		seen[i] = c.Val() > 0
+	}
+	return seen, nil
 }
 
-// Mark claims an event_id for the TTL window. Called AFTER a successful clean produce.
-func (d *Deduper) Mark(ctx context.Context, eventID string) error {
-	return d.rdb.Set(ctx, dedupKey(eventID), "", d.ttl).Err()
+// MarkBatch claims a set of event_ids for the TTL window in one pipelined SET round-trip.
+// Called AFTER a durable clean produce so a crash re-produces a collapsible duplicate
+// rather than dropping a unique event. Best-effort: an error is benign (ClickHouse dedups).
+func (d *Deduper) MarkBatch(ctx context.Context, eventIDs []string) error {
+	if len(eventIDs) == 0 {
+		return nil
+	}
+	pipe := d.rdb.Pipeline()
+	for _, id := range eventIDs {
+		pipe.Set(ctx, dedupKey(id), "", d.ttl)
+	}
+	_, err := pipe.Exec(ctx)
+	return err
 }

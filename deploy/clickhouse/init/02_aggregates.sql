@@ -38,8 +38,7 @@ SELECT
     operator_id,
     city,
     tariff_id,
-    toUInt8((toHour(timestamp) >= 7 AND toHour(timestamp) < 9)
-         OR (toHour(timestamp) >= 17 AND toHour(timestamp) < 20)) AS is_peak,
+    is_peak_priced AS is_peak,  -- peak = billed at the peak multiplier (recorded on SESSION_STOP), not a wall-clock hour
     sum(cost_eur) AS revenue_eur,
     count() AS sessions
 FROM ev.events_raw

@@ -24,6 +24,7 @@ type Metrics struct {
 	IngestionLag      prometheus.Histogram
 	RedisWrite        *prometheus.HistogramVec
 	CleanProduce      prometheus.Histogram
+	AnalyticsBatch    prometheus.Histogram
 	ConsumerLag       *prometheus.GaugeVec
 }
 
@@ -77,8 +78,13 @@ func NewMetrics() *Metrics {
 		}, []string{"op"}),
 		CleanProduce: promauto.NewHistogram(prometheus.HistogramOpts{
 			Name:    "processor_clean_produce_seconds",
-			Help:    "Latency of a synchronous clean-topic produce.",
+			Help:    "Latency of a synchronous clean-topic produce (one batch per observation).",
 			Buckets: produceB,
+		}),
+		AnalyticsBatch: promauto.NewHistogram(prometheus.HistogramOpts{
+			Name:    "processor_analytics_batch_size",
+			Help:    "Messages per analytics flush (size-or-time batch); confirms H1 batching.",
+			Buckets: []float64{1, 5, 10, 25, 50, 100, 200, 350, 500, 750, 1000},
 		}),
 		ConsumerLag: promauto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "processor_consumer_lag",

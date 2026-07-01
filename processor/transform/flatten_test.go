@@ -15,7 +15,7 @@ func TestCleanEventKeysMatchSchema(t *testing.T) {
 		"timestamp", "ingested_at", "operator_id", "lat", "lon", "city", "country",
 		"power_kw", "energy_kwh", "voltage_v", "current_a", "soc_percent",
 		"vehicle_brand", "vehicle_model", "ev_id", "tariff_id", "cost_eur",
-		"error_code", "component", "status",
+		"error_code", "component", "status", "is_peak_priced",
 	}
 	b, err := json.Marshal(CleanEvent{})
 	if err != nil {

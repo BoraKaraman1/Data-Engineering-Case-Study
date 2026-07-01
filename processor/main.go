@@ -59,15 +59,17 @@ func main() {
 
 	log.Printf("starting groups: realtime=%d analytics=%d on %q",
 		cfg.Workers.Realtime, cfg.Workers.Analytics, cfg.Kafka.TopicRaw)
+	log.Printf("analytics batching: batch_size=%d flush_ms=%d",
+		cfg.Analytics.BatchSize, cfg.Analytics.FlushMs)
 
 	var wg sync.WaitGroup
 	runGroup(ctx, &wg, cfg, m, groupSpec{
 		name: "realtime", groupID: cfg.Kafka.GroupRealtime,
 		workers: cfg.Workers.Realtime, handle: rt.handle,
 	})
-	runGroup(ctx, &wg, cfg, m, groupSpec{
+	runAnalyticsBatchGroup(ctx, &wg, cfg, m, batchGroupSpec{
 		name: "analytics", groupID: cfg.Kafka.GroupAnalytics,
-		workers: cfg.Workers.Analytics, handle: an.handle,
+		workers: cfg.Workers.Analytics, flush: an.flush,
 	})
 
 	<-ctx.Done()

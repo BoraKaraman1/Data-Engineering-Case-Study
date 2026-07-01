@@ -28,4 +28,10 @@ metrics:
 
 workers:
   realtime:  4                       # readers per group; parallelism caps at the 12 raw partitions
-  analytics: 12                      # one reader per partition; each blocks on a synchronous produce
+  analytics: 12                      # one reader per partition; each drains a size-or-time batch
+
+analytics:
+  batch_size: 500                    # flush after N messages accumulate in a worker's batch
+  flush_ms:   100                    # ...or after this long since the batch's first message,
+                                     # whichever comes first. Amortises the Redis EXISTS/SET,
+                                     # clean produce, and offset commit over the whole batch (H1).

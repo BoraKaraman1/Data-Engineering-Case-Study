@@ -183,8 +183,11 @@ measuring the pipeline.
 `WARMUP=40 MEASURE=80 bash scripts/scale_test.sh`). For each preset it recreates
 `registry-seed` → `simulator` → `processor` for the new roster, then records produced vs
 clean throughput, transport-lag percentiles, authoritative Redpanda consumer-group lag,
-and A1/A4 query latency to **`benchmarks/results.csv`**. The measured curve and the
-bottleneck analysis (processor I/O ceiling across analytics and realtime + a path to 100k) are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §11.
+and A1/A4 query latency to **`benchmarks/results.csv`** (the per-message baseline in the
+first four rows, the batched analytics build (H1) in the last four). The measured curve and
+the bottleneck analysis (the analytics produce/commit ceiling, now batched so `clean_eps`
+clears 100k, with the unchanged realtime path still capped above ~10k, plus the path to
+100k) are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §11.
 
 ---
 
