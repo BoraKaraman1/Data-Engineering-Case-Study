@@ -1,0 +1,72 @@
+# Simulator configuration. Everything the case asks to be configurable lives here:
+# station count, event rate, peak hours, fault rate, session behaviour.
+#
+# Phase-1 defaults are tuned for a LIVELY but REALISTIC demo you can watch:
+#   - 200 stations, time_acceleration 60 (1 simulated minute per wall second)
+#   - sessions complete in ~30-40 wall seconds, meter updates flow several per second
+#
+# For the Task-4 load test, raise station_count and time_acceleration and set
+# target_events_per_sec to the level you are measuring. See README "Scale presets".
+
+simulator:
+  station_count: 1000
+  connectors_per_station: [1, 4]      # each station gets a random count in this range
+  seed: 42                            # deterministic runs for reproducible reports
+
+  # The pacer caps emission at this rate (events/sec across all stations). It does
+  # NOT invent events: if the roster + time_acceleration produce fewer than this,
+  # you simply get the natural rate. Raise the roster/acceleration to go faster.
+  target_events_per_sec: 1000
+
+  # 1.0 = wall-clock realtime. Higher compresses the simulated day so sessions and
+  # meter cadence happen faster -> more throughput from the same station roster.
+  time_acceleration: 60.0
+
+  # Reliability testing hooks (the case's at-least-once + late/out-of-order tasks):
+  duplicate_rate: 0.02               # 2% of events are re-sent (same event_id) -> exercises dedup
+  out_of_order_rate: 0.01            # 1% of events are delayed -> arrive after later timestamps
+
+  fault_rate_per_hour: 0.05          # expected FAULT_ALERTs per connector per simulated hour
+  meter_interval_sec: [5, 30]        # METER_UPDATE cadence during a session (simulated seconds)
+
+  session_minutes:                   # charge-duration distribution (truncated normal)
+    mean: 35
+    stddev: 18
+    min: 5
+    max: 180
+
+  peak_windows:                      # higher arrival weight during morning / evening peaks
+    - { start: 7,  end: 9,  weight: 3.0 }
+    - { start: 17, end: 20, weight: 3.5 }
+  base_arrival_weight: 1.0
+
+  operators:                         # CPOs that own stations -> A2/A4 "per operator"
+    - "ChargeSquare"
+    - "VoltRun"
+    - "ZES"
+    - "Esarj"
+    - "Trugo"
+
+kafka:
+  brokers: ["redpanda:9092"]
+  topic_raw: "charging-events-raw"
+  acks: "one"                        # producer-side at-least-once
+  batch_size: 5000                   # batch writes for throughput
+  batch_timeout_ms: 50
+  async: true
+
+postgres:
+  dsn: "postgres://chargesquare:chargesquare@postgres:5432/chargesquare?sslmode=disable"
+  seed_registry: true                # write the generated station/connector roster to Postgres
+
+metrics:
+  listen: ":9101"
+
+cities:                              # rough coordinates + relative size weight (Turkey)
+  - { code: "IST", name: "Istanbul", lat: 41.0082, lon: 28.9784, weight: 30 }
+  - { code: "ANK", name: "Ankara",   lat: 39.9334, lon: 32.8597, weight: 12 }
+  - { code: "IZM", name: "Izmir",    lat: 38.4237, lon: 27.1428, weight: 10 }
+  - { code: "BUR", name: "Bursa",    lat: 40.1885, lon: 29.0610, weight: 6 }
+  - { code: "ANT", name: "Antalya",  lat: 36.8969, lon: 30.7133, weight: 6 }
+  - { code: "ADA", name: "Adana",    lat: 37.0000, lon: 35.3213, weight: 4 }
+  - { code: "KON", name: "Konya",    lat: 37.8746, lon: 32.4932, weight: 3 }

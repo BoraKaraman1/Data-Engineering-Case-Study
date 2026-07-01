@@ -1,0 +1,92 @@
+Phase 4 CPU profile - processor under load (100k preset backlog drain)
+======================================================================
+
+Command:
+  go tool pprof -top -seconds 20 http://localhost:9102/debug/pprof/profile
+  (captured immediately after scripts/scale_test.sh, processor draining a
+   ~20-27M-event analytics backlog; single-node dev-container Redpanda)
+
+Profile: cpu, 20s wall, 23.45s samples (117% -> multiple cores busy, NOT idle).
+
+Reading: the processor is I/O / network-syscall bound, not CPU-bound on the
+JSON transform. Flat time is dominated by the network write syscall; the
+cumulative view attributes it to (a) go-redis current-state writes on the
+realtime path, (b) kafka-go offset commit + produce on the analytics path,
+and (c) Snappy compression of the produce batches. encoding/json decode is a
+minor contributor (~6-8% cum). This matches BenchmarkFlattenValidate
+(~2.5 us/op): the transform is not the ceiling; the synchronous produce/commit
+I/O is.
+
+--- go tool pprof -top (flat, top 30) --------------------------------
+File: processor
+Build ID: e304171f38cdb7ee9198b55125b03c7eabc4bad3
+Type: cpu
+Duration: 20s, Total samples = 23.45s (117.24%)
+Showing nodes accounting for 16.29s, 69.47% of 23.45s total
+Dropped 561 nodes (cum <= 0.12s)
+Showing top 30 nodes out of 250
+      flat  flat%   sum%        cum   cum%
+     6.90s 29.42% 29.42%      6.90s 29.42%  internal/runtime/syscall/linux.Syscall6
+     2.28s  9.72% 39.15%      2.28s  9.72%  runtime.futex
+     1.37s  5.84% 44.99%      1.65s  7.04%  runtime.tryDeferToSpanScan
+     0.89s  3.80% 48.78%      0.89s  3.80%  runtime.nanotime (inline)
+     0.63s  2.69% 51.47%      2.29s  9.77%  runtime.scanObject
+     0.57s  2.43% 53.90%      0.57s  2.43%  runtime.memclrNoHeapPointers
+     0.52s  2.22% 56.12%      1.06s  4.52%  github.com/klauspost/compress/s2.encodeBlockBetterSnappyGo
+     0.37s  1.58% 57.70%      0.37s  1.58%  runtime.write1
+     0.20s  0.85% 58.55%      0.21s   0.9%  encoding/json.stateInString
+     0.18s  0.77% 59.32%      4.79s 20.43%  runtime.findRunnable
+     0.18s  0.77% 60.09%      0.25s  1.07%  time.now
+     0.17s  0.72% 60.81%      0.57s  2.43%  encoding/json.checkValid
+     0.17s  0.72% 61.54%      1.93s  8.23%  runtime.mallocgc
+     0.15s  0.64% 62.17%      0.19s  0.81%  encoding/json.(*decodeState).rescanLiteral
+     0.15s  0.64% 62.81%      0.58s  2.47%  runtime.mallocgcSmallScanNoHeader
+     0.14s   0.6% 63.41%      0.14s   0.6%  runtime.memmove
+     0.13s  0.55% 63.97%      0.13s  0.55%  runtime.typePointers.nextFast (inline)
+     0.13s  0.55% 64.52%      0.41s  1.75%  runtime.unlock2
+     0.12s  0.51% 65.03%      0.22s  0.94%  encoding/json.unquoteBytes
+     0.12s  0.51% 65.54%      0.12s  0.51%  runtime.arenaIndex (inline)
+     0.12s  0.51% 66.06%      0.53s  2.26%  runtime.selectgo
+     0.12s  0.51% 66.57%      0.12s  0.51%  runtime.tgkill
+     0.10s  0.43% 66.99%      1.37s  5.84%  encoding/json.(*decodeState).object
+     0.10s  0.43% 67.42%      0.29s  1.24%  runtime.scanObjectsSmall
+     0.09s  0.38% 67.80%      0.25s  1.07%  runtime.lock2
+     0.09s  0.38% 68.19%      0.31s  1.32%  runtime.mallocgcSmallNoscan
+     0.08s  0.34% 68.53%      0.16s  0.68%  runtime.casgstatus
+     0.08s  0.34% 68.87%      0.18s  0.77%  runtime.gcmarknewobject
+     0.08s  0.34% 69.21%      0.12s  0.51%  runtime.pcvalue
+     0.06s  0.26% 69.47%      0.72s  3.07%  bufio.(*Reader).Peek
+
+--- go tool pprof -top -cum (cumulative, top 24) ---------------------
+File: processor
+Build ID: e304171f38cdb7ee9198b55125b03c7eabc4bad3
+Type: cpu
+Duration: 20s, Total samples = 23.45s (117.24%)
+Showing nodes accounting for 7.33s, 31.26% of 23.45s total
+Dropped 561 nodes (cum <= 0.12s)
+Showing top 24 nodes out of 250
+      flat  flat%   sum%        cum   cum%
+     0.04s  0.17%  0.17%      8.78s 37.44%  main.runGroup.func1
+     6.90s 29.42% 29.59%      6.90s 29.42%  internal/runtime/syscall/linux.Syscall6
+     0.02s 0.085% 29.68%      6.26s 26.70%  syscall.Syscall
+         0     0% 29.68%      6.16s 26.27%  internal/poll.ignoringEINTRIO (inline)
+         0     0% 29.68%      6.12s 26.10%  syscall.RawSyscall6
+     0.02s 0.085% 29.77%      5.81s 24.78%  main.(*realtimeHandler).handle
+     0.03s  0.13% 29.89%      5.14s 21.92%  net.(*conn).Write
+     0.01s 0.043% 29.94%      5.11s 21.79%  net.(*netFD).Write
+     0.01s 0.043% 29.98%      5.10s 21.75%  internal/poll.(*FD).Write
+         0     0% 29.98%      5.07s 21.62%  syscall.Write (inline)
+     0.02s 0.085% 30.06%      5.07s 21.62%  syscall.write
+     0.01s 0.043% 30.11%      4.96s 21.15%  runtime.mcall
+     0.02s 0.085% 30.19%      4.94s 21.07%  runtime.park_m
+     0.02s 0.085% 30.28%      4.92s 20.98%  bufio.(*Writer).Flush
+     0.02s 0.085% 30.36%      4.91s 20.94%  runtime.schedule
+     0.18s  0.77% 31.13%      4.79s 20.43%  runtime.findRunnable
+         0     0% 31.13%      4.35s 18.55%  github.com/redis/go-redis/v9.(*Client).Process
+     0.02s 0.085% 31.22%      4.35s 18.55%  github.com/redis/go-redis/v9.(*hooksMixin).processHook (inline)
+         0     0% 31.22%      4.33s 18.46%  github.com/redis/go-redis/v9.(*baseClient).process
+         0     0% 31.22%      4.32s 18.42%  github.com/redis/go-redis/v9.(*baseClient)._process
+         0     0% 31.22%      4.32s 18.42%  github.com/redis/go-redis/v9.(*baseClient).withConn
+         0     0% 31.22%      4.06s 17.31%  github.com/segmentio/kafka-go.(*Generation).Start.func1
+         0     0% 31.22%      4.06s 17.31%  github.com/segmentio/kafka-go.(*Reader).commitLoop
+     0.01s 0.043% 31.26%      4.06s 17.31%  github.com/segmentio/kafka-go.(*Reader).commitLoopImmediate
