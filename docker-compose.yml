@@ -199,6 +199,28 @@ services:
     volumes:
       - ./config:/app/config:ro
 
+  # Batch layer (OPT-IN). Behind the `airflow` Compose profile, so a plain
+  # `docker compose up` NEVER starts it -- only `docker compose --profile airflow up`.
+  # Single container: `airflow standalone` = scheduler + webserver + SQLite metadata
+  # (SequentialExecutor), which is enough for the linear on-demand ev_analytics_daily
+  # DAG. It runs BESIDE the stream, never on it. redpanda-console owns host 8080, so
+  # Airflow is published on 8081. clickhouse resolves on the default net. See
+  # deploy/airflow/README.md.
+  airflow:
+    image: apache/airflow:2.10.3
+    profiles: ["airflow"]
+    command: standalone
+    ports:
+      - "8081:8080"
+    environment:
+      _PIP_ADDITIONAL_REQUIREMENTS: "clickhouse-connect==0.8.*"
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    volumes:
+      - ./deploy/airflow/dags:/opt/airflow/dags:ro
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+
 volumes:
   redpanda_data:
   clickhouse_data:

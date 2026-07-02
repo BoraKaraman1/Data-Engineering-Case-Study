@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.4'
+          cache: true
+          cache-dependency-path: |
+            simulator/go.sum
+            processor/go.sum
+      - name: simulator
+        working-directory: simulator
+        run: |
+          go build ./...
+          go vet ./...
+          test -z "$(gofmt -l .)"
+          go test ./... -race -count=1
+      - name: processor
+        working-directory: processor
+        run: |
+          go build ./...
+          go vet ./...
+          test -z "$(gofmt -l .)"
+          go test ./... -race -count=1
+      - name: benchmark smoke check
+        run: (cd processor && go test -run '^$' -bench BenchmarkFlattenValidate -benchtime 1x ./...)
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: unit tests
+        run: python -m unittest discover -s tests -v
+
+  compose-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: validate compose file
+        run: docker compose config -q

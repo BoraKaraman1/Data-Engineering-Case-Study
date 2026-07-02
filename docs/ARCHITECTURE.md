@@ -274,6 +274,13 @@ build on the team's JVM stack would port the same two-consumer-group design dire
   versioned, tested dbt models on top of the raw landing table, with the real-time
   rollups staying as materialized views. (The advert lists dbt as preferred; this is
   where it fits — batch transformation on top of the stream, not in the hot path.)
+- **Airflow for the batch layer**: the opt-in `ev_analytics_daily` DAG
+  (`deploy/airflow/`, behind the `airflow` Compose profile) already runs the five
+  scheduled tasks that belong off the hot path — a data freshness gate,
+  per-partition `OPTIMIZE`, exact revenue reconciliation from `events_raw FINAL`,
+  a PSI data-quality gate, and a TTL report. Airflow stays off the hot path; the
+  stream is supervised by the Kafka consumer-group coordinator, while batch owns
+  the scheduled, whole-partition work a per-message consumer structurally cannot do.
 - **Kubernetes** for orchestration: the compose services map to Deployments/
   StatefulSets; the processor and simulator scale horizontally by adding consumers up
   to the partition count. (Compose is the deliverable here per the brief; K8s is the

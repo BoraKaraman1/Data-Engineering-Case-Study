@@ -1,5 +1,7 @@
 # ChargeSquare (EV Charging Data Pipeline)
 
+[![CI](https://github.com/BoraKaraman1/Data-Engineering-Case-Study/actions/workflows/ci.yml/badge.svg)](https://github.com/BoraKaraman1/Data-Engineering-Case-Study/actions/workflows/ci.yml)
+
 Real-time + analytics pipeline for EV charging telemetry: a Go simulator produces a
 realistic charging-event firehose into Kafka; a Go processor (validate → dedup →
 route) feeds a Redis current-state store and a ClickHouse analytics store;
@@ -21,6 +23,9 @@ PostgreSQL holds the station/tariff registry; Prometheus + Grafana observe the l
 Full rationale (store selection, dedup, late/out-of-order, partitioning, the energy
 double-count trap, path to production) is in **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 
+**Start here: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — the final report tying the
+whole pipeline together (design decisions, the measured scale curve, production path).
+
 ---
 
 ## Build status
@@ -34,7 +39,7 @@ be run and checked before the next is added.
 | 2 | **Task 2 processor**: validate, dedup, route → Redis + clean topic + dlq | **done** |
 | 3 | **Task 3 queries** A1–A6 + revenue MV + Grafana dashboard + Python report | **done** |
 | 4 | **Task 4** scale test 1k→100k ev/s + bottleneck analysis | **done** |
-| 5 | **Task 5** final architecture report + production readiness | planned |
+| 5 | **Task 5** final architecture report + production readiness | **done** |
 
 The processor bridges **raw → clean**: it validates every event, dead-letters the bad
 ones, dedups on `event_id`, projects current state into Redis (latency-first consumer
@@ -162,6 +167,16 @@ repo root or from `analytics/`. Point it elsewhere with `CLICKHOUSE_HOST` /
 `CLICKHOUSE_PORT`. Every energy figure uses per-session **deltas**, never
 `SUM(energy_kwh)`. See the energy-trap note below and ARCHITECTURE §6.
 
+![A1 hourly energy](analytics/output/A1.png)
+
+The remaining charts:
+
+- [A2 — station uptime/downtime and worst stations per operator](analytics/output/A2.png)
+- [A3 — average charging duration and energy by vehicle brand](analytics/output/A3.png)
+- [A4 — revenue by operator/city/tariff and peak-rate share](analytics/output/A4.png)
+- [A5 — geographic distribution of faults (error density by city)](analytics/output/A5.png)
+- [A6 — power anomalies (sessions >2σ above the fleet mean)](analytics/output/A6.png)
+
 ---
 
 ## Scale presets (for the Phase-4 load test)
@@ -191,6 +206,36 @@ path to 100k / production are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §
 
 ---
 
+## Results
+
+Clean-topic throughput tracks the driven input rate the whole way up the curve —
+998.8182033053945 / 9998.254608923313 / 50208.66893329212 / 102658.74545454545 ev/s at
+the 1k / 10k / 50k / 100k presets. Realtime consumer-group lag stays bounded at every
+step (351 / 710 / 2281 / 12782 events, which at each preset's rate is well under a second
+of backlog), so current-state freshness holds under 1s. Full before/after batching
+analysis: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §11.
+
+| preset | target_eps | produced_eps | clean_eps | lag_p50 | lag_p95 | lag_p99 | realtime_lag | analytics_lag | a1_ms | a4_ms | redis_ms |
+|--------|-----------|--------------|-----------|---------|---------|---------|--------------|---------------|-------|-------|----------|
+| 1k | 1000 | 1019.4888888888889 | 998.8182033053945 | 0.4285786376802818 | 10.0 | 10.0 | 351 | 466 | 23 | 17 | 88 |
+| 10k | 10000 | 10197.511111111111 | 9998.254608923313 | 0.17504045821204253 | 10.0 | 10.0 | 710 | 1353 | 129 | 57 | 88 |
+| 50k | 50000 | 51240.71111111111 | 50208.66893329212 | 0.08708749088729392 | 10.0 | 10.0 | 2281 | 2193 | 2104 | 803 | 92 |
+| 100k | 100000 | 104592.45555555556 | 102658.74545454545 | 4.39809260131872 | 10.0 | 10.0 | 12782 | 7633 | 8634 | 3195 | 141 |
+
+*`*_eps` = events/sec; `lag_p50/p95/p99` = end-to-end transport lag in seconds;
+`realtime_lag`/`analytics_lag` = Kafka consumer-group backlog in events; `a1_ms`/`a4_ms`
+= ClickHouse server-side query time in ms; `redis_ms` = current-state point-read latency
+in ms.*
+
+## Batch layer (optional)
+
+`docker compose --profile airflow up` brings up Airflow at http://localhost:8081
+with the on-demand `ev_analytics_daily` DAG (freshness gate, per-partition
+OPTIMIZE, exact revenue reconciliation, PSI data-quality gate, TTL report). It is
+not started by the default stack. See [deploy/airflow/README.md](deploy/airflow/README.md).
+
+---
+
 ## Repo layout
 
 ```
@@ -210,7 +255,7 @@ analytics/                  A1–A6 queries + Python report (Phase 3)
 
 ---
 
-## Notes / limitations (Phase 1)
+## Notes & limitations
 
 - `energy_kwh` is **cumulative within a session** by design (it models a meter
   register). Summing raw `METER_UPDATE` rows therefore over-counts energy badly;
