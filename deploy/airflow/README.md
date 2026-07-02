@@ -19,10 +19,10 @@ container boot.
 
 ## What it does not touch
 
-It deliberately stays off the streaming path. The always-on consumers are
+Airflow does not participate in the streaming path. The always-on consumers are
 supervised by the Kafka consumer-group coordinator (and by Kubernetes in
-production), not by a scheduler. Airflow only reads and rewrites ClickHouse
-partitions on a schedule; it never sits in the ingest hot path.
+production), not by a scheduler. Airflow reads and rewrites ClickHouse partitions
+on a schedule only, keeping the ingest hot path clear.
 
 ## The DAG
 
@@ -31,9 +31,9 @@ partitions on a schedule; it never sits in the ingest hot path.
 1. `freshness_check` is a data freshness gate: it fails the run if
    `ev.events_raw` is empty or its newest `ingested_at` is more than 24h old.
 2. `optimize_closed_partition` runs `OPTIMIZE ... PARTITION <yyyymm> FINAL` on
-   the previous closed calendar month's partition, so reads stop paying the
-   ReplacingMergeTree FINAL cost. Partitions are monthly, so it never touches
-   the current (active) month and never runs a full-table optimize; it also
+   the previous closed calendar month's partition to eliminate the
+   ReplacingMergeTree FINAL cost on reads. Partitions are monthly, so the
+   current (active) month is never touched and no full-table optimize runs; it
    skips when that partition is already a single merged part.
 3. `reconcile_revenue` recomputes yesterday's revenue exactly from
    `events_raw FINAL` (each event counted once) and overwrites
@@ -41,26 +41,25 @@ partitions on a schedule; it never sits in the ingest hot path.
 4. `dq_psi_gate` computes PSI (last 7 days vs the prior 7) for per-session
    energy delta and per-row power, plus the dead-letter rate, and fails on
    drift past the thresholds.
-5. `enforce_ttl` is report-only: it logs partitions past the 13-month cutoff as
-   export/drop candidates. The table's own TTL performs the actual drop.
+5. `enforce_ttl` logs partitions past the 13-month cutoff as export/drop
+   candidates. The table's own TTL performs the actual drop.
 
 ## Why these tasks are batch, not stream
 
 Merge/dedup compaction (`OPTIMIZE`) and the cross-day exact reconciliation are
-inherently scheduled, whole-partition operations. A per-message streaming
-consumer works one event at a time inside a single insert block, so it cannot
-run a periodic whole-day recompute or a partition optimize. PSI drift and TTL
-enforcement are periodic window comparisons, not per-event work either.
+scheduled, whole-partition operations. A per-message streaming consumer works
+one event at a time inside a single insert block and cannot run a periodic
+whole-day recompute or partition optimize. PSI drift and TTL enforcement are
+periodic window comparisons, not per-event work.
 
 ## Executor reality
 
 `airflow standalone` is a single container: scheduler plus webserver on SQLite
-metadata, which gives the SequentialExecutor. That is sufficient for this DAG
-because it is a linear chain (`t1 >> t2 >> t3 >> t4 >> t5`) triggered on demand.
-The spec mentioned LocalExecutor, but LocalExecutor is incompatible with the
-SQLite metadata DB (`airflow db init` fails and the container never comes up),
-so forcing it would break the container. A production deployment would use a
-real metadata database (Postgres) with LocalExecutor or CeleryExecutor.
+metadata, which provides the SequentialExecutor. This is adequate for a linear
+chain (`t1 >> t2 >> t3 >> t4 >> t5`) triggered on demand. The spec mentioned
+LocalExecutor, but LocalExecutor is incompatible with SQLite (`airflow db init`
+fails), so it cannot be used. A production deployment would use Postgres as the
+metadata database with LocalExecutor or CeleryExecutor.
 
-The DAG is `schedule=None` on purpose so it never fires during grading. Trigger
-it manually from the UI.
+The DAG has `schedule=None` so it does not trigger during grading. Trigger it
+manually from the UI.

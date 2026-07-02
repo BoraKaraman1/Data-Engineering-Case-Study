@@ -1,17 +1,16 @@
 # Code-Review & Hardening Log
 
-This pipeline was built in phases and then **hardened across several independent,
-adversarial code-review passes** before submission. This log records each round, every
+This pipeline was built in phases and then hardened across several independent,
+adversarial code-review passes before submission. This log records each round, every
 finding, and the response.
 
-It deliberately includes the findings we **declined** and the reasoning for each. That is
-the point of the document: a reviewed system is defined as much by what it refuses to
-change as by what it fixes. Blindly applying every suggestion is what a one-shot generated
-app does; weighing each against the design and pushing back where a suggestion is
-scope-creep or contradicts a deliberate trade-off is what an engineered one does.
+It deliberately includes the findings we **declined** and the reasoning for each. A
+reviewed system is defined as much by what it refuses to change as by what it fixes. Each
+finding was triaged against the design; some were implemented, some were declined as
+trade-offs.
 
 Nothing here is decorative. Every "fixed" below is backed by a test, a live-stack check,
-or a measured number — never a hand-written one.
+or a measured number, never a hand-written one.
 
 ---
 
@@ -46,44 +45,45 @@ A finding is not "fixed" until something objective proves it:
 | R5 | Post-re-measurement review (external review) | 4 | 4 | 0 |
 | R6 | External review (working tree) | 2 | 1 | 1 |
 
-**33 review findings across six rounds, plus one feature-request evaluation — 30
-implemented, 4 deliberately declined** and documented below. Several fixes are a *later*
-review catching a gap in an *earlier* one — F3 → R3 `stopSession`, the freshness claim → R4
-2.1, two R4 store-write-lag changes that left artifacts stale → R5, and R3's PSI event-time
-anchor extended to `reconcile_revenue` → R6. The iteration is the point.
+**33 review findings across six rounds, plus one feature-request evaluation. 30
+implemented, 4 deliberately declined** and documented below. Fixes from later reviews caught
+gaps in earlier ones: F3 was refined by R3's `stopSession` fix; R4's freshness claim (2.1)
+exposed a measurement problem; R4's store-write-lag changes left artifacts stale, caught in
+R5; R3's PSI event-time anchor was extended to `reconcile_revenue` in R6. The iteration
+shows the cumulative effect of each round.
 
 ---
 
 ## R6 — External review (most recent)
 
-A full independent pass over the working tree (all four evaluation areas) flagged two items
-the R5 round had not reached, both in the batch / consumer layer: one Medium correctness bug
-and one Medium resilience trade-off. One fixed, one documented as deliberate. (The two High
-findings from the same review — the `is_peak_priced` premium bug and the shared-Redis
-eviction risk — were already logged and fixed under R5.)
+An independent pass over the working tree identified two issues the R5 round had not covered,
+both in the batch / consumer layer: one Medium correctness bug and one Medium resilience
+trade-off. One was fixed, one documented as deliberate. (Two High findings from the same
+review, the `is_peak_priced` premium bug and the shared-Redis eviction risk, were already
+logged and fixed under R5.)
 
 ### Fixed
 
 **Batch revenue reconcile ran on a wall-clock window (Medium).** `reconcile_revenue`
 (Airflow t3) filters the event-time `timestamp` column but scoped it with a wall-clock
-"yesterday," so under the simulator's accelerated event clock it reconciled an *empty*
-window — the exact class of bug R3 had already fixed for the PSI gate, left unfixed in this
-sibling task. *Fix:* anchor to `max(timestamp)` (the previous full event-time day) via a
-`_reconcile_bounds` helper, with an empty-table guard, matching the PSI gate and A1/A2/A4/A5.
-Verified `py_compile` + `tabnanny` clean; the DagBag import runs in CI.
+"yesterday." Under the simulator's accelerated event clock, it reconciled an empty window,
+the same class of bug R3 had already fixed for the PSI gate but left unfixed here. *Fix:*
+anchor to `max(timestamp)` (the previous full event-time day) via a `_reconcile_bounds`
+helper, with an empty-table guard, matching the PSI gate and A1/A2/A4/A5. Verified
+`py_compile` + `tabnanny` clean; the DagBag import runs in CI.
 
 ### Declined / deferred (documented, not implemented)
 
 **Analytics redelivery forces a consumer-group rejoin on a downstream-write failure (Medium).**
 On a flush error the reader is closed and recreated so kafka-go redelivers the uncommitted
-batch on a new generation; under a *sustained* ClickHouse / clean-topic outage the group can
-rebalance repeatedly instead of draining smoothly on recovery. It is correct (at-least-once:
-never commit before a durable produce) and harmless on a transient blip. The cleaner shape —
-retry the already-in-hand batch in place, no rejoin, same ordering — is a change to the
-*authoritative* commit path that wants live fault-injection (stop the sink, confirm
-`count() == uniqExact(event_id)` on recovery) before it lands, which is the wrong risk to take
-right before submission. *Response:* documented in ARCHITECTURE §9 with the retry-in-place
-upgrade path named; deferred, not rushed.
+batch on a new generation. Under a sustained ClickHouse or clean-topic outage, the group
+can rebalance repeatedly instead of draining smoothly on recovery. This is correct
+(at-least-once: never commit before a durable produce) and harmless on transient blips.
+Retrying the already-in-hand batch in place (no rejoin, same ordering) is the cleaner
+approach, but it changes the authoritative commit path and needs live fault-injection
+testing (stop the sink, confirm `count() == uniqExact(event_id)` on recovery) before
+landing. That risk is not acceptable right before submission. *Response:* documented in
+ARCHITECTURE §9 with the retry-in-place upgrade path named; deferred, not rushed.
 
 ### Also — two low-severity nits noted, not changed
 
@@ -128,14 +128,13 @@ weighting, pricing, and tariff selection. Added economic-flag tests and regenera
 analytics so A4 reflects the correction.
 
 **One Redis, one eviction policy, two opposite workloads (High, architecture).** Write-once
-dedup keys (safe to evict — ClickHouse's `ReplacingMergeTree` is the backstop) and
-must-persist current-state hashes (no backstop — Redis *is* the store) shared one 1 GB
-`allkeys-lru` instance. At the 100k preset the ~12M-key dedup working set can exceed the cap,
-and `allkeys-lru` then evicts across *all* keys — including live state, silently breaking the
-"current status in the last 5 minutes" guarantee. *Fix:* split into two instances — `redis`
-(state, `noeviction`) and `redis-dedup` (`allkeys-lru`) — so a dedup flood can never evict
-must-persist state, the store-selection call the two workloads' opposite memory lifecycles
-demanded.
+dedup keys are safe to evict because ClickHouse's `ReplacingMergeTree` is the backstop.
+Must-persist current-state hashes have no backstop; Redis is the store. Both shared one
+1 GB `allkeys-lru` instance. At the 100k preset, the ~12M-key dedup working set can exceed
+the cap, and `allkeys-lru` evicts across all keys, including live state, silently breaking
+the "current status in the last 5 minutes" guarantee. *Fix:* split into two instances:
+`redis` (state, `noeviction`) and `redis-dedup` (`allkeys-lru`). A dedup flood can never
+evict must-persist state, and each workload gets the memory lifecycle it needs.
 
 ### Also — a mislabeled artifact
 
@@ -162,12 +161,13 @@ fetch could block up to 10 s, violating the `<1 s` current-state SLO. *Fix:* spl
 reader config — realtime `MinBytes: 1`, `MaxWait ≈ 50 ms`; analytics keeps the throughput
 tuning but with an explicit 1 s `MaxWait`. Config-driven with defaults.
 
-**2.1 — Ingestion lag measured to the wrong point (High).** — see the flagship section
-below. The load test measured produce→clean-topic lag (a 10 s-capped histogram whose
-p95/p99 saturated), not true produce→store-write lag. *Fix:* a `produced_at` column carried
-end-to-end from the raw Kafka produce time; a realtime produce→Redis-apply histogram; wider
-buckets (to 120 s); a produce→ClickHouse-queryable freshness probe — then the **scale test
-was re-run** and `results.csv` regenerated with real numbers.
+**2.1 — Ingestion lag measured to the wrong point (High).** The load test measured
+produce→clean-topic lag (a 10 s-capped histogram whose p95/p99 saturated), not true
+produce→store-write lag. *Fix:* add a `produced_at` column carried end-to-end from the raw
+Kafka produce time, add a realtime produce→Redis-apply histogram, widen buckets to 120 s,
+and add a produce→ClickHouse-queryable freshness probe. The scale test was then re-run and
+`results.csv` regenerated with real numbers. (See the flagship section below for detailed
+results.)
 
 **2.3 — Dedup wording imprecise (Medium).** Docs called `event_id` "the dedup key," which
 reads as if `ReplacingMergeTree` dedups on `event_id` alone; it collapses the full ORDER BY
@@ -196,12 +196,11 @@ cancel-drop), just bounded.
 ### Declined (deliberate trade-offs — documented, not implemented)
 
 **3.1 — Real-time path commits offsets even if the Redis write fails.** This is the
-documented **best-effort state projection**: it validates but does not dead-letter, and
-commits after one bounded retry because current state self-heals from the next event (≤30 s
-meter cadence) plus the key TTL. The reviewer labelled it "an explicit trade-off." Building
-a state DLQ / replay topic would contradict the design and add machinery the case does not
-need. *Response:* documented as deliberate; the log-compacted state-rebuild topic is named
-as the production upgrade path.
+documented best-effort state projection: it validates but does not dead-letter, and commits
+after one bounded retry because current state self-heals from the next event (≤30 s meter
+cadence) plus the key TTL. Building a state DLQ / replay topic would contradict the design
+and add machinery this case does not need. *Response:* documented as deliberate; the
+log-compacted state-rebuild topic is named as the production upgrade path.
 
 **4.1 — Event schema mirrored between simulator and processor.** Intentional: they are
 independently deployed services that should share a schema *contract*, not a compile-time
@@ -221,11 +220,11 @@ should add nothing. *Fix:* cap the advance at `min(now, EndsAt)` and skip when `
 rewritten as a three-case table test (advances / full-battery-noop / caps-at-EndsAt).
 
 **Airflow PSI windows on wall-clock instead of event-time.** The data-quality gate compared
-distributions using `now()`-relative windows, but the simulator runs at
-`time_acceleration > 1`, so the event clock runs ahead. *Fix:* anchor the PSI windows to
-`max(timestamp)` (matching A1/A2/A4/A5). The DLQ-rate check deliberately keeps its **own
-wall-clock window** on `ingested_at` (processing-time the processor stamps in real time) — a
-two-clock split, commented in the DAG.
+distributions using `now()`-relative windows, but the simulator runs at `time_acceleration
+> 1`, so the event clock runs ahead. *Fix:* anchor the PSI windows to `max(timestamp)`
+(matching A1/A2/A4/A5). The DLQ-rate check deliberately uses its own wall-clock window on
+`ingested_at` (processing-time the processor stamps in real time), a two-clock split
+commented in the DAG.
 
 **Airflow PSI `power_kw` not read with `FINAL`.** The drift metric could double-count a
 redelivered `METER_UPDATE`. *Fix:* read from `ev.events_raw FINAL`. (A no-op on clean data;
@@ -285,9 +284,9 @@ artifacts**. Documented rather than built.
 
 The hard parts of this case are correctness under real distributed-systems conditions:
 at-least-once dedup, late/out-of-order arrival, the two-store split, and the cumulative-energy
-trap. Those were solved in the build phases and then **stress-tested** by the rounds above —
-including catching a regression in a prior fix (F3 → R3) and a measurement that pointed at the
-wrong instrument (R4 2.1). The declines show the same discipline pointed the other way.
+trap. Those were solved in the build phases and then stress-tested by the rounds above,
+including catching a regression in a prior fix (F3 → R3) and a measurement that pointed at
+the wrong instrument (R4 2.1). The declined findings show the same rigor applied in reverse.
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design rationale each of these findings was
 checked against, and `benchmarks/results.csv` for the measured scale curve referenced in R4.

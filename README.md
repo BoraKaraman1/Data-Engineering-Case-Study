@@ -23,10 +23,10 @@ PostgreSQL holds the station/tariff registry; Prometheus + Grafana observe the l
 Full rationale (store selection, dedup, late/out-of-order, partitioning, the energy
 double-count trap, path to production) is in **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 
-**Start here: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — the final report tying the
+**Start here: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the final report tying the
 whole pipeline together (design decisions, the measured scale curve, production path).
 
-**How it was hardened: [docs/REVIEW_LOG.md](docs/REVIEW_LOG.md)** — every finding from six
+**How it was hardened: [docs/REVIEW_LOG.md](docs/REVIEW_LOG.md)** documents every finding from six
 independent code-review rounds (33 in all) with the fix or the reasoned decline, and how each
 was verified.
 
@@ -34,8 +34,8 @@ was verified.
 
 ## Build status
 
-This is built and verified in phases that mirror the case tasks, so each layer can
-be run and checked before the next is added.
+The build proceeds in phases that match the case tasks, allowing each layer to run
+independently before the next is added.
 
 | Phase | Scope | Status |
 |------|-------|--------|
@@ -55,9 +55,9 @@ wait for, so the processor always sees a complete, fresh roster.
 
 ## Quick start
 
-Requires Docker + Docker Compose. One command brings up the whole stack (the
+Requires Docker + Docker Compose. One command starts the entire stack (the
 simulator's `go.sum` is committed, so the image builds hermetically, no manual
-step first):
+setup required):
 
 ```bash
 docker compose up --build
@@ -76,6 +76,15 @@ Services:
 | Simulator metrics | http://localhost:9101/metrics | |
 
 Kafka from your laptop (not from inside the compose network) is on `localhost:19092`.
+
+### Grafana dashboard
+
+A pre-provisioned dashboard (`ops-pipeline`) loads automatically at http://localhost:3000
+(`admin` / `admin`) without requiring an import step. It shows the pipeline live: event throughput by type,
+clean-topic write lag and realtime store-write lag (p50/p95/p99), authoritative Kafka
+consumer-group lag per group (from Redpanda), active charging sessions, the dead-letter rate,
+and the duplicate / out-of-order reliability injections. It reads the same Prometheus metrics
+the Phase-4 scale test records, so the dashboard and `benchmarks/results.csv` share one source.
 
 ---
 
@@ -106,7 +115,7 @@ docker compose exec postgres psql -U chargesquare -d chargesquare \
   -c "select count(*) stations from stations; select count(*) connectors from connectors;"
 ```
 
-**4. ClickHouse schema is present** (populated by the processor):
+**4. ClickHouse schema exists** (populated by the processor):
 
 ```bash
 docker compose exec clickhouse clickhouse-client -u chargesquare --password chargesquare \
@@ -157,7 +166,7 @@ docker compose exec redpanda rpk group describe realtime analytics --brokers loc
 
 ## Run the analytics (Phase 3)
 
-The six analytical queries live in `analytics/queries/` (A1–A6). A Jupyter notebook runs
+The six analytical queries are in `analytics/queries/` (A1–A6). A Jupyter notebook runs
 them against the live ClickHouse (HTTP, `:8123`) and writes one CSV per query:
 
 ```bash
@@ -185,7 +194,7 @@ The remaining charts:
 
 ## Scale presets (for the Phase-4 load test)
 
-Everything tunable lives in `config/simulator.yaml`. The achievable event rate is a
+All tunable parameters are in `config/simulator.yaml`. The achievable event rate is a
 function of `station_count` × `time_acceleration`; `target_events_per_sec` is a
 *cap* the pacer enforces, so you can hold a precise controlled input rate while
 measuring the pipeline.
@@ -213,7 +222,7 @@ path to 100k / production are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §
 
 ## Results
 
-Clean-topic throughput tracks the driven input rate the whole way up the curve — 1,001 /
+Clean-topic throughput tracks the driven input rate across all presets: 1,001 /
 10,008 / 50,202 / 102,666 ev/s of validated, deduped output at the 1k / 10k / 50k / 100k
 presets. The pipeline is instrumented with **three wall-clock store-write lags** (all
 acceleration-immune, measured from the raw Kafka produce time): produce → clean-topic write,
@@ -241,7 +250,7 @@ latency in ms (dominated by the `docker compose exec` spawn; a native `HGETALL` 
 
 ## Batch layer (optional)
 
-`docker compose --profile airflow up` brings up Airflow at http://localhost:8081
+`docker compose --profile airflow up` starts Airflow at http://localhost:8081
 with the on-demand `ev_analytics_daily` DAG (freshness gate, per-partition
 OPTIMIZE, exact revenue reconciliation, PSI data-quality gate, TTL report). It is
 not started by the default stack. See [deploy/airflow/README.md](deploy/airflow/README.md).

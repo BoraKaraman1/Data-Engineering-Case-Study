@@ -1,6 +1,14 @@
 # Architecture & Design Decisions
 
-EV charging data pipeline — real-time + analytics. This document explains *why* each
+> **TL;DR**: One validated Redpanda (Kafka) ingest stream fans out to two consumer groups:
+> a latency-first path projecting current state into **Redis** (point reads < 100 ms), and a
+> throughput-first path that validates → dedups → flattens into **ClickHouse** (columnar OLAP
+> for the A1–A6 reports). **PostgreSQL** owns the station/tariff registry. Deduplication is
+> layered (best-effort Redis in front of an authoritative `ReplacingMergeTree`); every window
+> is computed on event-time. The measured scale curve (1k→100k ev/s on one laptop) is in §11,
+> and the honest limitations in §9. The rest of this document is the *why* behind each call.
+
+EV charging data pipeline: real-time + analytics. This document explains *why* each
 piece is what it is, the alternatives considered, and what is deliberately left for
 later. The analytics layer (Phase 3) is in §10 and the measured performance / scale
 test (Phase 4) is in §11.
@@ -14,8 +22,8 @@ Two read patterns with very different shapes have to be served from one ingest s
 - **Operational / real-time.** "What is connector X doing *right now*?" Point lookups
   on the latest state per connector, target **< 100 ms**, and the event has to be
   visible **< 1 s** after it happens.
-- **Analytical.** Hourly/monthly/yearly aggregations over the full history — energy,
-  uptime, revenue, fault geography — scanning large time ranges.
+- **Analytical.** Hourly/monthly/yearly aggregations over the full history (energy,
+  uptime, revenue, fault geography), scanning large time ranges.
 
 Plus: a synthetic source at **10k–100k events/sec**, **at-least-once** delivery
 (duplicates are expected and must be handled), and late / out-of-order arrival.
@@ -71,10 +79,10 @@ flowchart LR
 
 ## 3. Store selection
 
-### Kafka (Redpanda) — ingest backbone
+### Kafka (Redpanda): ingest backbone
 
 A durable, partitioned log decouples a bursty producer from downstream consumers and
-lets multiple independent consumers read the same stream at their own pace — which is
+lets multiple independent consumers read the same stream at their own pace, which is
 exactly how the real-time and analytics paths are separated (Section 5). Partitioning
 by `station_id` gives **per-station ordering** without a global bottleneck.
 
@@ -83,7 +91,7 @@ ZooKeeper/KRaft sidecar, so `docker compose up` is clean and the footprint on a
 laptop is small. It is Kafka-API compatible, so nothing downstream is Redpanda-specific
 and a production move to MSK / Confluent / Strimzi is a config change, not a rewrite.
 
-### Redis — real-time current state
+### Redis: real-time current state
 
 The operational question is a **point lookup of the latest value per connector**, not
 a time-series scan. That is a key-value access pattern, and Redis serves it from memory
@@ -96,7 +104,7 @@ domains rather than the heartbeat masquerading as a connector-0 hash.
 Alternatives considered: **TimescaleDB / InfluxDB** are time-series stores and would
 work, but they are built for *range* queries over recent history; for a pure
 latest-value lookup they are heavier than a key-value store and add query latency.
-TimescaleDB is attractive because it is PostgreSQL (honoring the advert) — but the
+TimescaleDB is attractive because it is PostgreSQL (honoring the advert), but the
 access pattern, not the badge, should pick the store, and the pattern here is
 key-value. **Cassandra** is over-provisioned for a working-set that fits in memory.
 
@@ -104,41 +112,41 @@ Duplicates on this path are harmless: re-applying the same `METER_UPDATE` to cur
 state is idempotent (last write wins), so the real-time path does not need strict
 dedup, which keeps its latency low.
 
-**Two Redis instances, not one — opposite eviction needs.** The dedup layer (the analytics
+**Two Redis instances, not one: opposite eviction needs.** The dedup layer (the analytics
 path's `dedup:{event_id}` keys) and this current-state store run on **separate** Redis
 instances because their memory lifecycles are opposite. Dedup keys are write-once and *safe
-to evict* — ClickHouse's ReplacingMergeTree is the authoritative backstop, so a lost key only
-lets a duplicate through to be collapsed. State hashes *must not* be evicted before their TTL
-— Redis is the only store, so an early eviction silently breaks the "seen in the last 5
+to evict*: ClickHouse's ReplacingMergeTree is the authoritative backstop, so a lost key only
+lets a duplicate through to be collapsed. State hashes *must not* be evicted before their TTL:
+Redis is the only store, so an early eviction silently breaks the "seen in the last 5
 minutes" guarantee. One shared `allkeys-lru` instance would let a dedup flood (~12M keys at
 the 100k preset, over the 1 GB cap) evict live state. So state runs `noeviction` and dedup
-runs `allkeys-lru` on its own instance (`redis-dedup`) — a store-configuration split the two
+runs `allkeys-lru` on its own instance (`redis-dedup`), a store-configuration split the two
 access patterns demand, not one the badge does.
 
-### ClickHouse — analytics
+### ClickHouse: analytics
 
 The analytical queries scan large time ranges and aggregate. Columnar storage reads
 only the columns a query touches; vectorised execution and the MergeTree family make
 A1–A6 fast even over hundreds of millions of rows. ClickHouse also **self-ingests from
 Kafka** via its Kafka engine, so there is no row-by-row `INSERT` from application code
-(the classic way to fall over at scale) — the engine batches internally.
+(the classic way to fall over at scale): the engine batches internally.
 
 Alternatives: **DuckDB** is excellent but embedded/single-process and not built for a
-continuously-ingesting streaming sink. **BigQuery** is a managed warehouse — great
+continuously-ingesting streaming sink. **BigQuery** is a managed warehouse: great
 analytics, wrong fit for a self-contained local stack with a < 1 s freshness goal and
 no streaming-insert cost model.
 
-### PostgreSQL — registry (OLTP source of truth)
+### PostgreSQL: registry (OLTP source of truth)
 
-Reference data — stations, connectors, tariffs — is small, relational, and mutable.
+Reference data (stations, connectors, tariffs) is small, relational, and mutable.
 It belongs in an OLTP store, not duplicated as the authority inside the event
 firehose. This is the OLAP/OLTP split applied honestly: Postgres owns the *registry*;
-ClickHouse owns the immutable *events*. The processor loads the station registry —
-ids plus each station's operator, city, country and coordinates, and the tariff set —
-from Postgres **into memory** at startup -- refreshed on a config-gated interval so new stations/tariffs apply without a restart -- for referential validation: an event for
+ClickHouse owns the immutable *events*. The processor loads the station registry
+(ids plus each station's operator, city, country and coordinates, and the tariff set)
+from Postgres **into memory** at startup (refreshed on a config-gated interval so new stations/tariffs apply without a restart) for referential validation: an event for
 an unknown station, or one whose operator / city / country / coordinates or tariff
 disagree with the registered station, is dead-lettered (so a well-formed event with a
-wrong operator can't quietly pollute per-operator analytics) — and Postgres is never on
+wrong operator can't quietly pollute per-operator analytics), and Postgres is never on
 the hot path. The roster and tariffs are seeded transactionally by the simulator from a
 single canonical catalog rather than duplicated as SQL literals, so prices cannot drift
 between the generator and the registry. Postgres is also the most cleanly **droppable**
@@ -157,13 +165,13 @@ topic, because a flat row maps directly onto ClickHouse columns and avoids neste
 parsing in the hot ingest path. So the transform earns its place: nested-and-realistic
 on the way in, flat-and-analytics-friendly on the way to storage.
 
-Key fields: `event_id` (UUID — the logical dedup identity, unique per event), `event_type`, `station_id`,
+Key fields: `event_id` (UUID: the logical dedup identity, unique per event), `event_type`, `station_id`,
 `connector_id`, `session_id`, `timestamp` (event-time, ms, UTC), plus the meter /
 vehicle / location / fault sub-objects and, on stop, `cost_eur` with `is_peak_priced`
 (1 when the simulator billed that session at the peak multiplier).
 
-This nested schema is **mirrored on purpose** in two places — the simulator's wire
-producer (`./simulator`) and the processor's consumer (`./processor/transform`) — rather
+This nested schema is **mirrored on purpose** in two places, the simulator's wire
+producer (`./simulator`) and the processor's consumer (`./processor/transform`), rather
 than shared through a common Go module. They are independently deployed services, so the
 right coupling is a schema *contract*, not a compile-time code dependency that would
 re-link them into one unit. Drift is guarded today by `processor/transform/flatten_test.go`,
@@ -187,7 +195,7 @@ TTL toDateTime(timestamp) + INTERVAL 13 MONTH
   `ingested_at` is the version that decides which copy survives. This catches any
   late-arriving duplicate that fell outside the processor's Redis dedup window.
   (Caveat: collapsing happens on background merge, so exact-once reads use `FINAL`
-  or `argMax`/`GROUP BY` — applied in the A-queries where correctness needs it.)
+  or `argMax`/`GROUP BY`, applied in the A-queries where correctness needs it.)
 - **Partition by month of event-time** matches the monthly/yearly reporting grain and
   lets the engine prune whole partitions; the 13-month TTL drops old data cheaply.
 - **ORDER BY** leads with `station_id, connector_id` for query locality (most reports
@@ -222,28 +230,28 @@ single-consumer design is a valid MVP; this is the version that answers the case
 ### Real-time current state is deliberately best-effort
 
 The real-time path is a **best-effort state projection**, and that is a chosen trade-off,
-not a gap. It validates every event but does **not** dead-letter — the analytics group
-owns validation and the DLQ — and it **commits its offsets even when the Redis CAS fails**
+not a gap. It validates every event but does **not** dead-letter (the analytics group
+owns validation and the DLQ) and it **commits its offsets even when the Redis CAS fails**
 after one bounded retry (~50 ms), rather than head-of-line-blocking a whole partition on a
 Redis blip. It can afford this because current state is **self-healing**: an active
 connector emits its next `METER_UPDATE` within ≤30 s (the meter cadence tops out at 30 s),
 which overwrites any missed update, and the per-key TTL (5 min by default) expires anything
-that goes silent — so a lost write is corrected by the next event or aged out, not left
+that goes silent, so a lost write is corrected by the next event or aged out, not left
 stale forever. The stronger-recovery upgrade is a named **future item**: a log-compacted
 state-rebuild topic (or a state DLQ with replay) that lets the projection be reconstructed
 exactly after a Redis loss, instead of leaning on the next event to refresh it.
 
 ### Deduplication (the at-least-once requirement)
 
-The dedup **identity** is `event_id` (UUID), not `session_id + timestamp` — the latter
+The dedup **identity** is `event_id` (UUID), not `session_id + timestamp`: the latter
 collides across the many meter readings of one session and would wrongly drop distinct
 events. That identity is *logical*: it names the event. The storage layer's dedup is
-*physical* — it collapses rows sharing the full sort key (item 2 below), not `event_id`
+*physical*: it collapses rows sharing the full sort key (item 2 below), not `event_id`
 alone. The two coincide by construction, because a genuine at-least-once duplicate is a
 byte-identical re-send (same `event_id` *and* same tuple); a repeated `event_id` under a
 *different* tuple would be an invariant violation (`event_id` is unique per event), not a
 duplicate storage is expected to catch. Either way the exact analytics stay
-`event_id`-exact — `uniqExact(event_id)` / `argMax` / `FINAL` — independent of what a
+`event_id`-exact (`uniqExact(event_id)` / `argMax` / `FINAL`), independent of what a
 background merge has or hasn't collapsed. Correctness is layered, and the point that
 matters is **where it lives**:
 
@@ -251,14 +259,14 @@ matters is **where it lives**:
    `EXISTS event_id → produce to clean → Mark event_id` (`SET`, `EX <ttl>`). Marking
    only *after* a durable produce is deliberate: a crash between produce and mark
    re-produces a *duplicate* (which the storage layer collapses) rather than dropping a
-   *unique* event — the failure mode a bare `SET NX` *before* producing would cause, and
+   *unique* event, the failure mode a bare `SET NX` *before* producing would cause, and
    which ClickHouse could never recover. The TTL is sized to the realistic redelivery
    window (a minute or two), *not* hours; the storage layer covers anything later.
-   Duplicates share `station_id`, so they land on one partition and one worker —
+   Duplicates share `station_id`, so they land on one partition and one worker:
    `EXISTS`/`Mark` never race.
 2. **Storage (authoritative):** the landing table is `ReplacingMergeTree(ingested_at)`
    ordered by `(station_id, connector_id, event_type, timestamp, event_id)`. It collapses
-   rows sharing that **full sort key** — identical for a genuine re-send of one event —
+   rows sharing that **full sort key** (identical for a genuine re-send of one event)
    during background merges; reads needing exactness before a merge use `FINAL` /
    `uniqExact(event_id)`. **This is the dedup authority; Redis is only load-shedding in
    front of it.**
@@ -287,9 +295,9 @@ exercised, not assumed.
 
 Events are validated for schema (required fields, types, ranges) and **referentially**
 against the in-memory registry from Postgres: the station must exist, and its operator,
-city, country and coordinates (and any tariff) must match the registered station — so a
+city, country and coordinates (and any tariff) must match the registered station, so a
 well-formed event carrying the wrong operator or city is rejected, not quietly counted.
-Failures are not dropped silently — they are published to `charging-events-dlq` as
+Failures are not dropped silently: they are published to `charging-events-dlq` as
 `{raw_payload, error, ingested_at}` and landed in `ClickHouse.dead_letter`, so "what got
 rejected and why" is one SQL query.
 
@@ -300,7 +308,7 @@ rejected and why" is one SQL query.
 `energy_kwh` in a `METER_UPDATE` is the session's **cumulative** meter register, not the
 increment since the last reading. Naively `SUM(energy_kwh)` over raw meter rows counts
 the running total once per reading and over-states energy by roughly the number of
-readings per session — often 10×–50×. The analytics layer therefore computes **per-session
+readings per session, often 10×–50×. The analytics layer therefore computes **per-session
 deltas** (`max(energy) − min(energy)` per session, or the increment between consecutive
 readings via window functions, or the total carried on `SESSION_STOP`) and only then
 aggregates to the hour/day/month. This is called out explicitly because it is the single
@@ -308,7 +316,7 @@ easiest way to ship plausible-looking but wrong numbers.
 
 ---
 
-## 7. Language choice — Go (+ Python)
+## 7. Language choice: Go (+ Python)
 
 - **Go** for the simulator and processor: true parallelism (no GIL) is what makes a
   100k/sec hot path realistic; cheap goroutines fit the per-station/per-connector
@@ -331,10 +339,10 @@ build on the team's JVM stack would port the same two-consumer-group design dire
 - **dbt (dbt-clickhouse)** for the analytical models: A1–A6 and downstream marts as
   versioned, tested dbt models on top of the raw landing table, with the real-time
   rollups staying as materialized views. (The advert lists dbt as preferred; this is
-  where it fits — batch transformation on top of the stream, not in the hot path.)
+  where it fits: batch transformation on top of the stream, not in the hot path.)
 - **Airflow for the batch layer**: the opt-in `ev_analytics_daily` DAG
   (`deploy/airflow/`, behind the `airflow` Compose profile) already runs the five
-  scheduled tasks that belong off the hot path — a data freshness gate,
+  scheduled tasks that belong off the hot path: a data freshness gate,
   per-partition `OPTIMIZE`, exact revenue reconciliation from `events_raw FINAL`,
   a PSI data-quality gate, and a TTL report. Airflow stays off the hot path; the
   stream is supervised by the Kafka consumer-group coordinator, while batch owns
@@ -370,8 +378,8 @@ build on the team's JVM stack would port the same two-consumer-group design dire
   model.
 - Analytics redelivery on a downstream-write failure forces a consumer-group rejoin
   to re-read the uncommitted batch (kafka-go only redelivers uncommitted offsets on a
-  new generation). This preserves at-least-once — the batch is never committed before
-  a durable produce — and is harmless on a transient blip, but under a *sustained*
+  new generation). This preserves at-least-once (the batch is never committed before
+  a durable produce) and is harmless on a transient blip, but under a *sustained*
   ClickHouse/clean-topic outage the group can rebalance repeatedly instead of draining
   smoothly on recovery. The cleaner shape is to retry the already-in-hand batch in
   place (no rejoin, same at-least-once ordering); it is deliberately deferred rather
@@ -388,7 +396,7 @@ The six analytical questions are answered by the queries in `analytics/queries/`
 (`analytics/report.ipynb`) that executes them and writes `analytics/output/A1..A6.csv`.
 
 **Only revenue is a streaming aggregate.** `deploy/clickhouse/init/02_aggregates.sql`
-defines exactly one materialized view — `revenue_hourly` (SummingMergeTree) — as a *fast,
+defines exactly one materialized view, `revenue_hourly` (SummingMergeTree), as a *fast,
 slightly approximate* dashboard rollup. `cost_eur` is a per-`SESSION_STOP` scalar, so
 summing one row per session inside a single insert block is correct. It is only
 *approximate* because the MV fires before the ReplacingMergeTree dedup, so a duplicate
@@ -398,7 +406,7 @@ MV that periodically recomputes from `FINAL`.
 
 **Peak revenue is what was billed at a peak *premium*, not a clock window.** The simulator
 applies each tariff's multiplier inside the peak windows it reads from the config's
-`peak_windows` (the same 07–09 / 17–20 the spec and arrival-weighting use — one source of
+`peak_windows` (the same 07–09 / 17–20 the spec and arrival-weighting use, one source of
 truth, not a hardcoded literal), and sets `is_peak_priced` on the SESSION_STOP row **only
 when a premium was actually charged** (`PeakMult > 1.0`), not merely when the clock was
 in-window. So a `standard-v1` stop at 18:00 (multiplier 1.00, billed at base) and a
@@ -408,10 +416,10 @@ is. A4 and the `revenue_hourly` rollup take `peak_revenue_eur` straight from tha
 downstream, so a base-rate session is never filed as peak revenue for its clock hour and a
 peak-billed session just outside a reporting window is not dropped from it.
 
-**A1, A2, A3, A5, A6 are query-time exact analytics, not MVs — deliberately.** Each needs
+**A1, A2, A3, A5, A6 are query-time exact analytics, not MVs, deliberately.** Each needs
 state spanning *many* insert blocks, which a streaming MV (block-local) cannot hold:
 
-- energy (A1, A3) is a per-session **delta** of the cumulative meter register — `max−min`
+- energy (A1, A3) is a per-session **delta** of the cumulative meter register: `max−min`
   or the increment between consecutive readings across a whole session, whose readings
   arrive over many blocks;
 - uptime (A2) reconstructs each connector's **status timeline** (segment durations between
@@ -421,7 +429,7 @@ state spanning *many* insert blocks, which a streaming MV (block-local) cannot h
   statistics over the full history.
 
 Expressing these exactly means reading `events_raw` (with `FINAL` / `uniqExact` where a
-pre-merge duplicate would otherwise show) at query time — which ClickHouse does quickly.
+pre-merge duplicate would otherwise show) at query time, which ClickHouse does quickly.
 
 **Event-time, not wall-clock.** With `time_acceleration > 1` the simulated event clock runs
 ahead of wall time, so the time-windowed queries (A1 = 7 days, A4/A5 = 30 days) anchor the
@@ -432,7 +440,7 @@ window to `max(timestamp)` in the data, not `now()`, which would otherwise clip 
 
 ---
 
-## 11. Performance — measured scale test (Phase 4)
+## 11. Performance: measured scale test (Phase 4)
 
 The harness (`scripts/scale_test.sh`) drives the simulator through four presets by swapping
 `CONFIG_PATH` (recreating `registry-seed` -> `simulator` -> `processor` per preset so the
@@ -479,7 +487,7 @@ per-event Kafka produce/commit and Redis round trips. The processor now amortise
 
 **Throughput.** The tuned run keeps the analytics path essentially at input rate through the
 full curve: at 100k, `clean_eps` is 102,666/s against 104,528 accepted raw events/s. The
-authoritative consumer-group lag is bounded rather than growing without limit — at 100k,
+authoritative consumer-group lag is bounded rather than growing without limit: at 100k,
 `realtime_lag` is 11,599 events and `analytics_lag` is 10,088 events, roughly 0.11 s and 0.10 s
 of backlog relative to the measured input rate. The Redis point read remains dominated by
 `docker compose exec` overhead (`redis_ms` 85–147 ms in the CSV; a native `HGETALL` is
@@ -490,14 +498,14 @@ production to store write, so the harness measures three wall-clock lags, each a
 raw Kafka produce time (`produced_at`, carried end to end into ClickHouse) and therefore immune
 to `time_acceleration`:
 
-- **`clean_lag`** — produce → durably on the clean topic (the analytics path's own write),
+- **`clean_lag`**: produce → durably on the clean topic (the analytics path's own write),
   from `processor_transport_lag_seconds`. Sub-second across the whole curve (p99 0.99 / 0.76 /
   0.25 / 0.43 s at 1k / 10k / 50k / 100k).
-- **`rt_apply`** — produce → Redis current-state apply, the realtime store-write SLO, from the
+- **`rt_apply`**: produce → Redis current-state apply, the realtime store-write SLO, from the
   new `processor_state_apply_lag_seconds` emitted right after the CAS returns. This is the
-  number the freshness target is really about: p99 is **50 ms through 50k and 0.69 s at 100k**
-  — under 1 s even at saturation, measured directly rather than inferred from consumer lag.
-- **`ch_fresh`** — produce → queryable in ClickHouse, sampled as `now() − max(produced_at)`.
+  number the freshness target is really about: p99 is **50 ms through 50k and 0.69 s at 100k**,
+  under 1 s even at saturation, measured directly rather than inferred from consumer lag.
+- **`ch_fresh`**: produce → queryable in ClickHouse, sampled as `now() − max(produced_at)`.
   Holds ~3–4 s across the curve; that is the Kafka-engine block-flush cadence (throughput
   tracks input the whole way up, so it is not a growing backlog), and it is the one lag that
   includes the asynchronous engine-ingest hop the processor does not control.
@@ -507,7 +515,7 @@ path's clean-topic write) with a 10 s top bucket, whose p95/p99 saturated and co
 as the Redis freshness signal. That gap is now closed: the realtime-apply histogram is emitted
 directly, and the lag buckets extend to 120 s so the percentiles stay real instead of pegging at
 10. So the local compose run supports the case's realtime freshness target at 100k in the
-strong sense — a direct produce→apply measurement, not just a consumer-lag inference.
+strong sense, a direct produce→apply measurement, not just a consumer-lag inference.
 
 **Query duration.** A1 and A4 are true server-side ClickHouse timings from
 `clickhouse-client --time` (the harness no longer wall-clock-wraps `docker compose exec`). They
