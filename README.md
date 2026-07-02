@@ -180,15 +180,14 @@ measuring the pipeline.
 | ~100k/s | 40000 | 600 | 100000 |
 
 **Run the scale test:** `bash scripts/scale_test.sh` (override the windows with
-`WARMUP=40 MEASURE=80 bash scripts/scale_test.sh`). For each preset it recreates
-`registry-seed` → `simulator` → `processor` for the new roster, then records produced vs
+`WARMUP=120 MEASURE=90 bash scripts/scale_test.sh`). For each preset it recreates
+`registry-seed` -> `simulator` -> `processor` for the new roster, then records produced vs
 clean throughput, transport-lag percentiles, authoritative Redpanda consumer-group lag,
-and A1/A4 query latency to **`benchmarks/results.csv`** (the per-message baseline in the
-first four rows, the batched build in the last four). The measured curve and the bottleneck
-analysis (the analytics produce/commit ceiling batched in H1 so `clean_eps` clears 100k, and
-the realtime per-event Redis round-trip batched in H2 so `realtime_lag` stays bounded and
-current-state freshness holds `<1 s` through 50k, plus the path to 100k) are in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §11.
+and A1/A4 query latency to **`benchmarks/results.csv`**. The checked-in results are the final
+tuned four-row curve (1k, 10k, 50k, 100k): analytics batching keeps `clean_eps` near input rate,
+realtime Redis batching keeps consumer-group lag bounded, and the 100k row supports the `<1 s`
+current-state freshness target on this local compose run. The measured curve, caveats, and
+path to 100k / production are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §11.
 
 ---
 

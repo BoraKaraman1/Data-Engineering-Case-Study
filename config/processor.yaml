@@ -27,7 +27,7 @@ metrics:
   pprof:  true                       # /debug/pprof for Phase-4 profiling; LOCAL-ONLY, disable in prod
 
 workers:
-  realtime:  4                       # readers per group; parallelism caps at the 12 raw partitions
+  realtime:  12                       # readers per group; parallelism caps at the 12 raw partitions
   analytics: 12                      # one reader per partition; each drains a size-or-time batch
 
 analytics:

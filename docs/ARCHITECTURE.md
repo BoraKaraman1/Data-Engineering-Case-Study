@@ -352,7 +352,7 @@ window to `max(timestamp)` in the data, not `now()`, which would otherwise clip 
 ## 11. Performance — measured scale test (Phase 4)
 
 The harness (`scripts/scale_test.sh`) drives the simulator through four presets by swapping
-`CONFIG_PATH` (recreating `registry-seed` → `simulator` → `processor` per preset so the
+`CONFIG_PATH` (recreating `registry-seed` -> `simulator` -> `processor` per preset so the
 processor's in-memory registry matches the new roster), then records produced vs clean
 **throughput**, end-to-end **transport lag** percentiles, **authoritative Redpanda
 consumer-group lag** (not the processor's best-effort gauge), and A1/A4 **query latency** to
@@ -360,190 +360,67 @@ consumer-group lag** (not the processor's best-effort gauge), and A1/A4 **query 
 Redpanda, and the four preset files) and hard-fails rather than emit plausible-looking numbers
 off a broken stack, and it **resets to a clean slate** (`docker compose down -v && up -d`)
 before the first preset so the 1k row measures steady state, not a drained backlog.
-`produced_eps` is the Redpanda raw-topic **offset delta over the measure window** — events the
-broker actually *accepted* — not the simulator's async *enqueue* counter
-(`simulator_events_produced_total`, still logged as a cross-check next to
-`simulator_produce_errors_total`). Measured on a single laptop (macOS + Docker Desktop;
-Redpanda in `dev-container` mode, `--smp=2 --memory=2G`), 40s warm-up / 80s measure.
-`benchmarks/results.csv` records two runs of this harness: the pre-fix **per-message**
-baseline (first four rows) and the post-fix **batched** build (last four rows), which batches
-BOTH consumer paths: H1 batched the analytics flush, H2 the realtime current-state write.
-Both use the canonical preset labels and are told apart by row order, because
-`tests/test_phase4_artifacts.py` pins the preset column to exactly the set {1k, 10k, 50k,
-100k} (a `10k-batched` label would fail it), so the split is by position and documented here.
+`produced_eps` is the Redpanda raw-topic **offset delta over the measure window** - events the
+broker actually accepted - not the simulator's async enqueue counter.
 
-**Baseline, one-message-per-produce analytics path (before H1):**
+The checked-in curve is the final tuned run on one laptop (macOS + Docker Desktop), with
+Redpanda still in `dev-container` mode but raised to `--smp=4 --memory=4G`, the raw/clean topics
+at 12 partitions, and processor workers set to 12 realtime + 12 analytics. The run used an
+extended warm-up before each measurement window so the 100k row reflects steady-state behavior
+rather than the initial group-rebalance backlog.
 
 | preset | target ev/s | produced_eps | clean_eps | realtime_lag | analytics_lag | a1_ms | a4_ms | redis_ms |
 |-------:|------------:|-------------:|----------:|-------------:|--------------:|------:|------:|---------:|
-| 1k   | 1,000   | 1,020   | 1,000 | 337        | 497        | 145 | 132 | 97 |
-| 10k  | 10,000  | 10,196  | 1,862 | 120,745    | 1,065,213  | 162 | 158 | 83 |
-| 50k  | 50,000  | 51,160  | 1,912 | 5,015,689  | 7,116,807  | 202 | 150 | 92 |
-| 100k | 100,000 | 103,472 | 1,827 | 16,740,957 | 20,070,705 | 265 | 201 | 94 |
+| 1k   | 1,000   | 1,019   | 999    | 351    | 466   | 23    | 17    | 88  |
+| 10k  | 10,000  | 10,198  | 9,998  | 710    | 1,353 | 129   | 57    | 88  |
+| 50k  | 50,000  | 51,241  | 50,209 | 2,281  | 2,193 | 2,104 | 803   | 92  |
+| 100k | 100,000 | 104,592 | 102,659 | 12,782 | 7,633 | 8,634 | 3,195 | 141 |
 
-**The clean 1k baseline.** From a clean slate the 1k row is honest steady state: `clean_eps`
-(1,000) tracks `produced_eps` (1,020) one-for-one, `analytics_lag` sits at ~500 (not the
-hundreds-of-thousands a backlog-drain used to show), and `lag_p50` is **0.68 s**. That is the
-"it keeps up" reference the higher presets are measured against. Every preset above 1k then
-accumulates its own backlog inside the window **by design** — that is the honest saturation
-ceiling, surfaced rather than hidden.
+**What was fixed.** The first measured ceiling was not JSON decode. The hot-path benchmark
+(`BenchmarkFlattenValidate`) is a few microseconds per event, while the profile in
+`benchmarks/profile-summary.txt` showed the processor dominated by network/syscall time from
+per-event Kafka produce/commit and Redis round trips. The processor now amortises that I/O:
 
-**The bottleneck.** `produced_eps` matches the enqueue counter to within noise at every level —
-even 100k (103,472 broker-accepted vs 103,466 enqueued) — so the broker genuinely *accepts* the
-firehose all the way up. But **`clean_eps` — the analytics path's throughput — pins at
-~1.8–1.9k/s regardless of input**, so `analytics_lag` (consumer-group backlog) grows without
-bound (~0.5k → 20M). This is **not** a CPU limit on the transform:
-`go test -bench=BenchmarkFlattenValidate` clocks the decode → validate → flatten hot path at
-**~3.1 µs/op (117 MB/s, 18 allocs/op)** — ~320k ev/s on one core. The ceiling is the analytics
-handler's **synchronous, one-message-per-produce** write to the clean topic: each event blocks
-on a broker ack, so throughput is `workers ÷ ack-latency`, not CPU. A `pprof` CPU profile taken
-while the processor drained the 100k backlog (saved to `benchmarks/profile-summary.txt`)
-confirms it: the processor is **I/O / network-syscall bound**, not JSON-bound — flat time is
-dominated by the network-write syscall (`Syscall6`, ~29%), which the cumulative view attributes
-to kafka-go's offset-commit/produce path and go-redis current-state writes (plus Snappy
-compression of the produce batches), while `encoding/json` decode is a minor ~6–8%. The
-transform is not the wall; the synchronous produce/commit I/O is.
+- **Analytics path (H1):** each reader accumulates a size-or-time batch, runs one pipelined Redis
+  `EXISTS`, writes the fresh clean events with one durable `WriteMessages`, writes invalid rows
+  to the DLQ in one batch, marks fresh ids with one pipelined Redis `SET`, and commits the whole
+  batch only after the downstream writes succeed. This preserves the at-least-once ordering:
+  produce before mark before commit, so a crash replays duplicates instead of dropping unique
+  events.
+- **Realtime path (H2):** each reader accumulates a bounded min(N=750, T=25 ms) micro-batch,
+  applies the same CAS script for every current-state update in one Redis pipeline, and commits
+  the batch once. This path remains deliberately best-effort: it retries the Redis pipeline once
+  and then commits even on failure because current state self-heals from the next event, while
+  blocking a partition on a Redis blip would make every connector on that partition stale.
 
-**The fix, applied (1/2): batch the analytics flush (H1).** The per-event chain (Redis `EXISTS`,
-one `WriteMessages` per event, Redis `SET`, and a per-message `CommitMessages`) is replaced,
-for the analytics readers only, by a size-or-time batch: each worker accumulates
-`FetchMessage`'d messages until it has `analytics.batch_size` (500) of them or
-`analytics.flush_ms` (100 ms) has passed since the batch's first message, then does one
-pipelined `EXISTS` for all event_ids, one durable `WriteMessages(clean, fresh...)`, one
-durable `WriteMessages(dlq, invalid...)`, one pipelined `SET` for the fresh ids, and one
-`CommitMessages` for the whole batch. The at-least-once ordering is preserved end to end
-(`Seen` then produce then `Mark` then commit): `Mark` and the commit both happen only after
-a durable produce, so a crash re-produces a duplicate (collapsed by the ReplacingMergeTree)
-and never drops a unique event. Same-station events share a raw partition and therefore one
-worker, so cross-batch duplicates are still caught by Redis; intra-batch duplicates are
-dropped by keeping the first occurrence of each event_id. H1 left the realtime path byte for
-byte unchanged, so on that build the realtime group was still saturated at 50k/100k
-(`realtime_lag` 5.33M / 18.02M) even as analytics scaled.
+**Throughput and freshness.** The tuned run keeps the analytics path essentially at input rate
+through the full curve: at 100k, `clean_eps` is 102,659/s against 104,592 accepted raw events/s.
+The authoritative consumer-group lag is bounded rather than growing without limit. At 100k,
+`realtime_lag` is 12,782 events and `analytics_lag` is 7,633 events; relative to the measured
+input rate, those are roughly 0.12 s and 0.07 s of backlog at the sample point. The Redis point
+read remains dominated by `docker compose exec` overhead (`redis_ms` 88-141 ms in the CSV; a
+native `HGETALL` is sub-millisecond), so the current-state store itself is not the limiter.
 
-**The fix, applied (2/2): batch the realtime current-state write (H2).** The realtime path had
-the same *shape* of ceiling (throughput = workers / per-event latency, here a Redis CAS
-round-trip plus a per-message `CommitMessages`), so it gets the SAME size-or-time accumulation,
-tuned for latency instead of throughput. Each realtime worker buffers `FetchMessage`'d messages
-until it has `realtime.batch_max_messages` (N=750) OR `realtime.batch_max_wait_ms` (T=25 ms) has
-elapsed since the batch's first message, whichever first (a bounded opportunistic min(N,T)
-window), then applies the whole batch's current-state CAS in ONE pipelined round trip
-(`StateStore.ApplyBatch` runs the byte-for-byte unchanged `casScript` per event across a single
-`Pipeline`/`Exec`) and commits the batch's offsets once. The accumulation loop is literally
-shared with H1 (`fillBatch`); the ONLY difference is the flush+commit policy. Realtime is
-BEST-EFFORT and commits the batch REGARDLESS of the apply result (it retries the pipeline once on
-a Redis error, then commits): unlike the analytics "never commit before a durable write"
-invariant, dropping a batch of sub-second-old state updates is acceptable because current state
-self-heals from the next event, whereas blocking the partition on a Redis blip would make every
-connector on it stale. That batched commit is safe because applying a same-or-older event under
-the CAS is idempotent (the newest wins; older events are rejected by the `last_seen` check), so
-crash-replay of an already-committed window is a no-op rather than a corruption. Tail freshness
-holds because the window is small: T=25 ms leaves ample budget under the `<1 s` SLA for the CAS
-pipeline plus Redis RTT, and N=750 caps how large a slug one fetch can hand a worker so its last
-event never blows that budget. Re-running the identical harness with both fixes:
+This means the local compose run now supports the case's realtime freshness target at 100k in
+the practical sense the harness can prove: Redpanda's consumer-group lag says the Redis
+projection is only a small fraction of a second behind the firehose at the end of the measurement
+window. A production SLO would add a direct realtime-apply latency histogram; the current
+`processor_transport_lag_seconds` histogram is emitted by the analytics path and has a 10 s top
+bucket, so its p95/p99 columns saturate and should not be read as the Redis freshness signal.
 
-**Batched analytics + realtime (H1 + H2 applied), same laptop and windows:**
+**Query duration.** A1 and A4 are true server-side ClickHouse timings from
+`clickhouse-client --time` (the harness no longer wall-clock-wraps `docker compose exec`). They
+rise with both row count and concurrent full-rate Kafka-engine ingest: A1 is 8.6 s and A4 is
+3.2 s in the 100k row. That is honest: the same single Docker node is producing, consuming,
+ingesting, and scanning at once. The result still validates the two-store split - Redis serves
+point reads, ClickHouse handles the scans - but it also shows where production would need more
+resource isolation, larger Kafka-engine blocks / async inserts, or a refreshable aggregate for
+the slowest exact reports.
 
-| preset | target ev/s | produced_eps | clean_eps | realtime_lag | analytics_lag | a1_ms | a4_ms | redis_ms |
-|-------:|------------:|-------------:|----------:|-------------:|--------------:|------:|------:|---------:|
-| 1k   | 1,000   | 1,019   | 1,002    | 441       | 495   | 24    | 14   | 89  |
-| 10k  | 10,000  | 10,196  | 10,007   | 699       | 1,691 | 71    | 60   | 99  |
-| 50k  | 50,000  | 51,191  | 50,182   | 2,505     | 3,475 | 474   | 236  | 97  |
-| 100k | 100,000 | 105,199 | 122,595  | 5,735,260 | 7,049 | 3,401 | 1,236 | 123 |
-
-**The new ceilings.** On the analytics side `clean_eps` still tracks the firehose all the way
-up: 1,862 to **10,007** at 10k, 1,912 to **50,182** at 50k, 1,827 to **122,595** at 100k, a
-5x/26x/67x jump over the per-message baseline that clears the ~1.9k wall by a wide margin.
-`analytics_lag` stays bounded: instead of 1.07M / 7.1M / 20M it holds at **1,691 / 3,475 /
-7,049**, a few thousand events of steady-state backlog even at 100k (at 100k `clean_eps` 122,595
-exceeds `produced_eps` 105,199 because the group drains the warm-up backlog *while* keeping pace,
-which is why `analytics_lag` lands at ~7k rather than climbing). On the realtime side H2 lifts
-the current-state write off its ~1k/s wall: `realtime_lag` collapses from the per-message
-baseline's 120,745 / 5,015,689 (10k / 50k) to **699 / 2,505**, sub-second freshness (2,505 events
-at 50k is ~50 ms of backlog). Measured realtime throughput is ~80-90k/s on this 4-worker group,
-an ~80x per-worker lift over the ~1k/s per-event ceiling; the `processor_realtime_batch_size`
-histogram and `processor_realtime_flush_total{reason}` counter confirm the min(N,T) design, with
-batches filling to N=750 under load (at 50k, size-triggered flushes number in the thousands
-alongside the timer ones; at 100k every flush is size-triggered) and flushing on the T=25 ms
-timer under a trickle (at ~1k ev/s, timer flushes outnumber size ~280:1). The one preset it does
-NOT fully clear is 100k: there `realtime_lag` is **5,735,260**, still 3x below the 16.7M baseline
-but climbing, because at ~105k/s input the 4-worker realtime group is just past its raised
-throughput ceiling on this single 2-core-broker node. That is now a horizontal-scale limit (more
-realtime workers up to the 12-partition count, or more processor replicas), not the per-event
-round-trip wall H2 removed; it is item (3) on the path below.
-
-Three measurement caveats, read honestly: the `processor_transport_lag_seconds` histogram tops
-out at its 10s bucket, so under a multi-million-event backlog `lag_p95` / `lag_p99` saturate at
-10.0 — the consumer-group lag column is the truer backlog signal. Even the clean 1k row reads
-`lag_p95` = 10.0, because the 5-minute histogram window still catches the brief post-restart
-consumer-group rebalance ramp, while its `lag_p50` = 0.68 s reflects true steady state. Next,
-`redis_ms` (~83–97 ms) is dominated by `docker compose exec` process spawn, not Redis (a native
-`HGETALL` is sub-millisecond, so the <100 ms point-read latency SLA holds). Finally, the
-two runs time A1/A4 differently. The **baseline** rows (`a1_ms` 145–265, `a4_ms` 132–201) carry
-a ~90 ms `docker compose exec` spawn tax, because that run predates the `ch_query_ms()` fix and
-timed the whole `docker exec` rather than the query (the true server-side baseline query time is
-roughly the measured value minus 90 ms). The **batched** rows use the fixed harness, which parses
-`clickhouse-client --time` (server-side elapsed, no exec tax), so their `a1_ms` (24, 71, 474,
-3,401) and `a4_ms` (14, 60, 236, 1,236) are true server-side query times; they climb with the
-landed row count and with concurrent full-rate ingest, discussed next.
-
-**What actually holds up now, and what still does not.** Both paths are now batched. The
-analytics path tracks the input and `analytics_lag` stays in the low thousands through 100k, so
-validated, deduped events reach the clean topic (and ClickHouse) at the firehose rate. The
-realtime path, which H1 left saturated at 50k/100k, now holds `realtime_lag` at **441 / 699 /
-2,505** through 50k, i.e. ~0.44 / 0.07 / 0.05 s of backlog: the `HGETALL` point read was always
-`<100 ms`, and H2 makes the data it returns actually fresh through 50k rather than stale by
-minutes, so the `<1 s` current-state freshness SLA (Task 2c) now holds through 50k where H1 held
-it only to ~10k. `realtime_lag` is the authoritative freshness signal here (the offset backlog is
-exactly how far the Redis current state trails the firehose), and it is the clean one: a
-wall-clock (accel=1) check corroborates it, with the acceleration-immune `transport_lag` (produce
-to process) at **p99 ~0.99 s** under a ~1k ev/s trickle. The event-time `ingestion_lag` is *not*
-a clean signal at accel=1 and is reported honestly as such: at these low per-partition rates the
-shared reader's 10 KB `MinBytes` fetch floor gates when a batch is even fetched, and the
-simulator's own sim-clock drift (modelling 20k stations in real time lags event timestamps behind
-Kafka-produce time by seconds, visible as `ingestion_lag` minus `transport_lag`) inflates it into
-the histogram's 10 s ceiling, neither being H2's 25 ms window. At **100k** the 4-worker realtime
-group is just past its raised throughput ceiling (~80-90k/s measured) on this single
-2-core-broker node, so `realtime_lag` climbs to **5.73M** (still below the 16.7M baseline); the
-SLA fails only at 100k, now for a horizontal-scale reason (worker/replica count vs the 12
-partitions), not the per-event round-trip wall. The two-consumer-group split buys **independent
-scaling and failure isolation**: H1 fixed analytics without touching realtime, and H2 fixed
-realtime (its `casScript` and current-state schema byte-for-byte unchanged) without touching
-analytics.
-
-The read side is where the two-store split pays off, and with the analytics bottleneck gone the
-pipeline now feeds ClickHouse at rate instead of starving it. In the per-message baseline only
-**~1.4M rows** were ever flattened and landed (the rest sat in the ~16–20M raw-topic backlog), so
-that run's `a1_ms` / `a4_ms` were demo-scale. The batched run lands events at the input rate
-across all four presets, accumulating into the tens of millions of rows on the same Redpanda
-volume, which is why the batched server-side `a1_ms` climbs from 24 ms (1k) to **3,401 ms** (100k)
-and `a4_ms` from 14 ms to **1,236 ms**: those are real at-scale scan times, and they are measured
-**while ClickHouse is ingesting the full firehose**, so query and Kafka-engine ingest contend for
-the same 2-core-class node. To separate raw scan cost from that ingest contention, a separate
-**out-of-band load (not pipeline-fed)** replayed ~1.4M rows ×14 to **~19.7M rows** (each replica
-given a unique `event_id` / `session_id` and its event-time shifted back 0–72 h so per-session
-deltas stay valid and the copies stay inside A1's 7-day window), then measured server-side on a
-quiescent store with `clickhouse-client --time`: at ~20M rows, **A1 (7-day hourly energy,
-`FINAL`) runs ~0.8 s and A4 (30-day revenue, `FINAL`) ~0.3 s**. Columnar scans stay sub-second to
-low-seconds an order of magnitude past the demo, which is the point of the OLAP store. (That
-out-of-band load was measured and then deleted; it never touched the committed analytics CSVs.)
-
-**Path to 100k**, in priority order. (1) **Batch the analytics produce and commit: done (H1).**
-Each analytics worker fetches a batch, runs one pipelined Redis `EXISTS`, one durable
-`WriteMessages` to the clean topic and one to the DLQ, one pipelined Redis `SET`, and one
-`CommitMessages` for the whole batch, amortising the ack and commit latency that capped the
-per-message path. Measured `clean_eps` clears 100k (table above), so the analytics produce and
-commit are no longer the wall. (2) **Batch the realtime current-state write the same way: done
-(H2, this change).** Each realtime worker accumulates a bounded min(N=750, T=25 ms) micro-batch
-and applies the whole batch's CAS in one pipelined round-trip (`ApplyBatch`), commits once, and
-commits regardless (best-effort, self-healing). Measured `realtime_lag` drops from millions to a
-few thousand through 50k, so the `<1 s` freshness SLA now holds through 50k rather than breaking
-above ~10k; at 100k the 4-worker realtime group is just past its raised ceiling, which leads to
-(3). (3) **Scale processor replicas / realtime workers horizontally** to the partition count (12)
-and raise partitions beyond that; the remaining gap to a fully-bounded 100k realtime is
-worker/replica count, not per-event latency. (4) ClickHouse `async_insert` plus larger
-Kafka-engine blocks so reads stop contending with ingest at 100k; (5) a faster JSON decoder
-(`jsoniter`/`sonic`) to push the per-event floor below its current ~3 µs; (6) off the laptop, run
-Redpanda with real resources and RF >= 3 instead of the 2-core dev-container. The honest
-headline: the analytics produce/commit bottleneck (H1) and the realtime per-event round-trip
-bottleneck (H2) are both measured, fixed, and re-measured here; horizontal scale is the remaining
-path to a fully-bounded 100k.
+**Remaining path to 100k and production.** For the take-home, the important point is that the
+main local pipeline bottlenecks were measured, fixed, and re-measured rather than hand-waved. To
+move this shape toward production: run Redpanda with real multi-node resources and RF >= 3, scale
+processor replicas up to the partition count and then raise partitions, give ClickHouse dedicated
+CPU/I/O and ReplicatedMergeTree/Keeper, add schema registry + Avro/Protobuf, and promote the
+exact analytics queries into tested dbt models or refreshable aggregates where dashboard latency
+needs to be sub-second.

@@ -28,8 +28,8 @@ services:
       - --schema-registry-addr=internal://0.0.0.0:8081,external://0.0.0.0:18081
       - --rpc-addr=redpanda:33145
       - --advertise-rpc-addr=redpanda:33145
-      - --smp=2
-      - --memory=2G
+      - --smp=4
+      - --memory=4G
       - --mode=dev-container
     ports:
       - "19092:19092"   # Kafka API from the host (use localhost:19092 from your laptop)
