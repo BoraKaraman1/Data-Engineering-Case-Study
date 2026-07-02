@@ -15,7 +15,7 @@ PostgreSQL holds the station/tariff registry; Prometheus + Grafana observe the l
                   │               │                            (Kafka engine → ReplacingMergeTree → revenue MV)
                   │               └──► Kafka (dlq) ──────────► ClickHouse.dead_letter
                   │
- PostgreSQL ◄─────┘ station/tariff registry (OLTP source of truth; loaded once into memory)
+ PostgreSQL ◄─────┘ station/tariff registry (OLTP source of truth; loaded into memory, refreshed periodically)
 
  Prometheus scrapes simulator + processor  →  Grafana dashboards
 ```
@@ -26,8 +26,8 @@ double-count trap, path to production) is in **[docs/ARCHITECTURE.md](docs/ARCHI
 **Start here: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — the final report tying the
 whole pipeline together (design decisions, the measured scale curve, production path).
 
-**How it was hardened: [docs/REVIEW_LOG.md](docs/REVIEW_LOG.md)** — every finding from four
-independent code-review rounds (27 in all) with the fix or the reasoned decline, and how each
+**How it was hardened: [docs/REVIEW_LOG.md](docs/REVIEW_LOG.md)** — every finding from six
+independent code-review rounds (33 in all) with the fix or the reasoned decline, and how each
 was verified.
 
 ---

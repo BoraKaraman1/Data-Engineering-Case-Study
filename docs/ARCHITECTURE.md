@@ -57,7 +57,7 @@ flowchart LR
     RAW --> RT --> REDIS
     RAW --> AN -->|valid, deduped, flat| CLEAN
     AN -->|invalid| DLQ
-    PG -. loaded once into memory .-> PROC
+    PG -. loaded into memory, refreshed .-> PROC
     SIM -. seeds roster .-> PG
     CLEAN --> QEUE --> RAWT --> MV
     RAWT -. query-time A1–A6 .-> RPT
@@ -135,7 +135,7 @@ It belongs in an OLTP store, not duplicated as the authority inside the event
 firehose. This is the OLAP/OLTP split applied honestly: Postgres owns the *registry*;
 ClickHouse owns the immutable *events*. The processor loads the station registry —
 ids plus each station's operator, city, country and coordinates, and the tariff set —
-from Postgres **once into memory** at startup for referential validation: an event for
+from Postgres **into memory** at startup -- refreshed on a config-gated interval so new stations/tariffs apply without a restart -- for referential validation: an event for
 an unknown station, or one whose operator / city / country / coordinates or tariff
 disagree with the registered station, is dead-lettered (so a well-formed event with a
 wrong operator can't quietly pollute per-operator analytics) — and Postgres is never on
