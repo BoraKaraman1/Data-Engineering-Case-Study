@@ -28,6 +28,11 @@ type Metrics struct {
 	RealtimeBatch     prometheus.Histogram
 	RealtimeFlush     *prometheus.CounterVec
 	ConsumerLag       *prometheus.GaugeVec
+
+	// RealtimeInvalidSkipped is the realtime path's coarse best-effort counter (no rule
+	// label); the authoritative per-rule ValidationErrors is emitted only on the analytics
+	// path, so the two consumer groups no longer double-count the same failure.
+	RealtimeInvalidSkipped prometheus.Counter
 }
 
 func NewMetrics() *Metrics {
@@ -101,6 +106,10 @@ func NewMetrics() *Metrics {
 			Name: "processor_consumer_lag",
 			Help: "Best-effort consumer lag per group from kafka-go reader stats.",
 		}, []string{"group"}),
+		RealtimeInvalidSkipped: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "processor_realtime_invalid_skipped_total",
+			Help: "Events the best-effort realtime path skipped as undecodable/invalid; authoritative validation errors are on the analytics path.",
+		}),
 	}
 }
 

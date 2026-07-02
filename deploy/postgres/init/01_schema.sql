@@ -31,14 +31,10 @@ CREATE TABLE IF NOT EXISTS tariffs (
     peak_multiplier   REAL NOT NULL DEFAULT 1.0
 );
 
--- Tariffs are few and static, so seed them here. The simulator references these
--- ids and prices when it computes cost_eur, keeping costs internally consistent.
-INSERT INTO tariffs (tariff_id, name, price_per_kwh_eur, peak_multiplier) VALUES
-    ('standard-v1',  'Standard',        0.39, 1.00),
-    ('peak-rate-v2', 'Peak Rate',       0.49, 1.35),
-    ('off-peak-v1',  'Off Peak',        0.29, 0.80),
-    ('fleet-v1',     'Fleet Contract',  0.34, 1.00)
-ON CONFLICT (tariff_id) DO NOTHING;
+-- Tariff ROWS are not seeded here. The simulator's registry-seed (SeedRegistry)
+-- populates this table transactionally from its canonical Go tariffCatalog, so the
+-- prices have a single source of truth shared with the cost_eur math -- no drift
+-- between what the DB holds and what the simulator bills.
 
 CREATE INDEX IF NOT EXISTS idx_stations_operator ON stations (operator_id);
 CREATE INDEX IF NOT EXISTS idx_stations_city ON stations (city);

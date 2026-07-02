@@ -136,14 +136,32 @@ var vehicleFleet = []struct {
 	{vehicleModel{"Togg", "T10X", 88, 180}, 6}, // local hero
 }
 
-var tariffPrices = map[string]struct {
-	base float64
-	peak float64
-}{
-	"standard-v1":  {0.39, 1.00},
-	"peak-rate-v2": {0.49, 1.35},
-	"off-peak-v1":  {0.29, 0.80},
-	"fleet-v1":     {0.34, 1.00},
+// Tariff is one pricing plan. tariffCatalog is the SINGLE source of truth for tariff
+// pricing: registry.go seeds these same rows into the Postgres tariffs table, so the
+// registry the processor validates against can't drift from the cost math used here.
+type Tariff struct {
+	ID       string
+	Name     string
+	Base     float64 // price per kWh, EUR
+	PeakMult float64 // multiplier applied to Base during the peak window
+}
+
+var tariffCatalog = []Tariff{
+	{"standard-v1", "Standard", 0.39, 1.00},
+	{"peak-rate-v2", "Peak Rate", 0.49, 1.35},
+	{"off-peak-v1", "Off Peak", 0.29, 0.80},
+	{"fleet-v1", "Fleet Contract", 0.34, 1.00},
+}
+
+// tariffByID indexes tariffCatalog for O(1) pricing lookups in stopSession.
+var tariffByID = indexTariffs(tariffCatalog)
+
+func indexTariffs(catalog []Tariff) map[string]Tariff {
+	m := make(map[string]Tariff, len(catalog))
+	for _, t := range catalog {
+		m[t.ID] = t
+	}
+	return m
 }
 
 var faultCodes = []struct {
@@ -170,6 +188,9 @@ func (g *rng) pickCity() City {
 	total := 0
 	for _, c := range g.cfg.Cities {
 		total += c.Weight
+	}
+	if total <= 0 {
+		return g.cfg.Cities[0]
 	}
 	n := g.r.Intn(total)
 	for _, c := range g.cfg.Cities {
@@ -369,11 +390,21 @@ func (st *Station) meterTick(conn *Connector, now time.Time, g *rng) Event {
 // stopSession ends a session and emits the SESSION_STOP with totals + cost.
 func (st *Station) stopSession(conn *Connector, now time.Time) Event {
 	s := conn.session
-	price := tariffPrices[s.TariffID]
-	rate := price.base
+	// Advance energy/SoC across the final interval since the last METER_UPDATE
+	// (mirrors meterTick) so the SESSION_STOP total and its billed cost include
+	// the tail instead of undercounting it.
+	if dtHours := now.Sub(conn.lastMeterAt).Hours(); dtHours > 0 {
+		added := chargingPower(s) * dtHours
+		s.EnergyKWh += added
+		s.Soc = math.Min(100, s.Soc+(added/s.BatteryKWh)*100)
+		conn.lastMeterAt = now
+	}
+
+	t := tariffByID[s.TariffID]
+	rate := t.Base
 	peakPriced := false
 	if h := now.Hour(); h >= 17 && h < 21 {
-		rate = price.base * price.peak
+		rate = t.Base * t.PeakMult
 		peakPriced = true
 	}
 	cost := s.EnergyKWh * rate

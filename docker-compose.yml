@@ -64,6 +64,20 @@ services:
         rpk topic create charging-events-raw   -p 12 -r 1 --brokers redpanda:9092 || true
         rpk topic create charging-events-clean  -p 12 -r 1 --brokers redpanda:9092 || true
         rpk topic create charging-events-dlq     -p 3  -r 1 --brokers redpanda:9092 || true
+        # Create is idempotent (|| true), so a topic left over from an earlier run with the
+        # WRONG partition count is silently reused. Assert the real count and fail fast: 12
+        # raw/clean partitions is the processor's consumer-parallelism assumption. ($$ escapes
+        # the shell's $ so Compose passes it through instead of interpolating it away.)
+        assert_parts() {
+            got="$$(rpk topic list --brokers redpanda:9092 | awk -v t="$$1" '$$1 == t {print $$2}')"
+            if [ "$${got:-0}" != "$$2" ]; then
+                echo "ERROR: topic $$1 has $${got:-0} partitions, expected $$2" >&2
+                exit 1
+            fi
+        }
+        assert_parts charging-events-raw   12
+        assert_parts charging-events-clean 12
+        assert_parts charging-events-dlq    3
         echo "topics ready"; rpk topic list --brokers redpanda:9092
     restart: "no"
 

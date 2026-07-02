@@ -13,8 +13,17 @@ var benchPayload = []byte(`{"event_id":"b1","event_type":"METER_UPDATE","station
 // flatten. Phase-4 uses this to attribute the per-event CPU cost when profiling throughput.
 func BenchmarkFlattenValidate(b *testing.B) {
 	reg := &Registry{
-		stations: map[string]int{"TR-IST-0001": 2},
-		tariffs:  map[string]struct{}{"standard-v1": {}},
+		stations: map[string]stationMeta{
+			"TR-IST-0001": {
+				numConnectors: 2,
+				operatorID:    "ChargeSquare",
+				city:          "Istanbul",
+				country:       "TR",
+				lat:           41,
+				lon:           29,
+			},
+		},
+		tariffs: map[string]struct{}{"standard-v1": {}},
 	}
 	now := time.Now()
 	b.ReportAllocs()

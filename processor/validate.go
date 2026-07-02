@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"time"
 
 	"chargesquare/processor/transform"
@@ -73,6 +74,27 @@ func Validate(e transform.Event, reg *Registry) *ValidationError {
 	}
 	if e.Location.Lat < -90 || e.Location.Lat > 90 || e.Location.Lon < -180 || e.Location.Lon > 180 {
 		return verr("bad_geo", "lat/lon out of range")
+	}
+
+	// Referential cross-check against the seeded station: a well-formed event that names a
+	// real station but the wrong operator/city/country/coords is corrupt (or misrouted) and
+	// would pollute analytics grouped by operator/city, so reject it. Runs after the
+	// non-empty/bounds checks above (so an empty field reports missing_*, not a mismatch).
+	// The station exists here (checked above), so the meta lookup cannot miss. Strings are
+	// matched exactly; coordinates within a generous epsilon (float round-trip through
+	// Postgres+JSON), since the simulator emits exactly the seeded station coords.
+	meta, _ := reg.StationMeta(e.StationID)
+	if e.OperatorID != meta.operatorID {
+		return verr("operator_mismatch", "operator_id %q does not match station operator %q", e.OperatorID, meta.operatorID)
+	}
+	if e.Location.City != meta.city {
+		return verr("city_mismatch", "city %q does not match station city %q", e.Location.City, meta.city)
+	}
+	if e.Location.Country != meta.country {
+		return verr("country_mismatch", "country %q does not match station country %q", e.Location.Country, meta.country)
+	}
+	if math.Abs(e.Location.Lat-meta.lat) > 1e-4 || math.Abs(e.Location.Lon-meta.lon) > 1e-4 {
+		return verr("geo_mismatch", "lat/lon (%v,%v) does not match station (%v,%v)", e.Location.Lat, e.Location.Lon, meta.lat, meta.lon)
 	}
 
 	// HEARTBEAT is station-level (connector 0); everything else must name a real

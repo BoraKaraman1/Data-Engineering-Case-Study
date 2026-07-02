@@ -89,7 +89,9 @@ The operational question is a **point lookup of the latest value per connector**
 a time-series scan. That is a key-value access pattern, and Redis serves it from memory
 in well under a millisecond. The processor maintains one hash per connector
 (`station:{id}:{conn}` → power, status, soc, session, last-seen), so "current state"
-is a single `HGETALL`.
+is a single `HGETALL`. Station-level HEARTBEAT liveness is kept under a separate
+`station_liveness:{id}` key, so station liveness and connector state stay distinct
+domains rather than the heartbeat masquerading as a connector-0 hash.
 
 Alternatives considered: **TimescaleDB / InfluxDB** are time-series stores and would
 work, but they are built for *range* queries over recent history; for a pure
@@ -120,10 +122,16 @@ no streaming-insert cost model.
 Reference data — stations, connectors, tariffs — is small, relational, and mutable.
 It belongs in an OLTP store, not duplicated as the authority inside the event
 firehose. This is the OLAP/OLTP split applied honestly: Postgres owns the *registry*;
-ClickHouse owns the immutable *events*. The processor loads valid station IDs from
-Postgres **once into memory** at startup for referential validation (an event for an
-unknown station is dead-lettered) — so Postgres is never on the hot path and adds no
-throughput risk. It is also the most cleanly **droppable** component if scope tightens.
+ClickHouse owns the immutable *events*. The processor loads the station registry —
+ids plus each station's operator, city, country and coordinates, and the tariff set —
+from Postgres **once into memory** at startup for referential validation: an event for
+an unknown station, or one whose operator / city / country / coordinates or tariff
+disagree with the registered station, is dead-lettered (so a well-formed event with a
+wrong operator can't quietly pollute per-operator analytics) — and Postgres is never on
+the hot path. The roster and tariffs are seeded transactionally by the simulator from a
+single canonical catalog rather than duplicated as SQL literals, so prices cannot drift
+between the generator and the registry. Postgres is also the most cleanly **droppable**
+component if scope tightens.
 
 ---
 
@@ -223,17 +231,23 @@ time) is kept for lag metrics. An event arriving after its window has been publi
 not lost: it lands in the same table, and the reports re-resolve it at query time via
 `FINAL` / `uniqExact` reads once late rows merge. (The single streaming rollup, revenue,
 is the one exception; its exact counterpart is the A4 `FINAL` query.)
-Pathologically late events (beyond a grace bound) are still queryable but flagged, so a
-report can choose to include or exclude them. The simulator deliberately injects a
-configurable fraction of out-of-order and duplicate events so this path is exercised,
-not assumed.
+There is no watermark or grace bound: every event is accepted no matter how late, and
+ordering is resolved entirely at query time (event-time windows + `FINAL`). The tradeoff
+is that a pathologically late event silently merges into and shifts an already-published
+historical aggregate; a stricter policy (a watermark plus an `is_late` flag and a
+late-event route) is a documented future item, not built here. The simulator deliberately
+injects a configurable fraction of out-of-order and duplicate events so this path is
+exercised, not assumed.
 
 ### Validation & dead-letter
 
 Events are validated for schema (required fields, types, ranges) and **referentially**
-against the in-memory station set from Postgres. Failures are not dropped silently —
-they are published to `charging-events-dlq` as `{raw_payload, error, ingested_at}` and
-landed in `ClickHouse.dead_letter`, so "what got rejected and why" is one SQL query.
+against the in-memory registry from Postgres: the station must exist, and its operator,
+city, country and coordinates (and any tariff) must match the registered station — so a
+well-formed event carrying the wrong operator or city is rejected, not quietly counted.
+Failures are not dropped silently — they are published to `charging-events-dlq` as
+`{raw_payload, error, ingested_at}` and landed in `ClickHouse.dead_letter`, so "what got
+rejected and why" is one SQL query.
 
 ---
 

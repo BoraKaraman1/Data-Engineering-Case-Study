@@ -3,7 +3,10 @@
 --
 -- Per-session average power is computed over its METER_UPDATE readings (avgIf, since
 -- SESSION_START carries power 0), and the vehicle brand is pulled from SESSION_START
--- (anyIf) in the same pass. Each session is compared to the fleet-wide mean (avg) and
+-- (anyIf) in the same pass. The source is read with FINAL so duplicate METER_UPDATEs
+-- (ReplacingMergeTree) collapse before aggregation -- an exact read that keeps
+-- avgIf(power_kw) and the z-scores from being skewed by dupes (matches A1/A3).
+-- Each session is compared to the fleet-wide mean (avg) and
 -- population standard deviation (stddevPop); it is flagged when
 -- avg_power_kw > mean + 2 * sigma. (A refinement would z-score within brand or against
 -- the connector's rated power, since a 250 kW DC session isn't anomalous next to a
@@ -16,7 +19,7 @@ WITH
             anyIf(vehicle_brand, event_type = 'SESSION_START') AS brand,
             avgIf(power_kw, event_type = 'METER_UPDATE') AS avg_power_kw,
             countIf(event_type = 'METER_UPDATE') AS readings
-        FROM ev.events_raw
+        FROM ev.events_raw FINAL
         WHERE event_type IN ('SESSION_START', 'METER_UPDATE')
         GROUP BY session_id
         HAVING readings >= 3

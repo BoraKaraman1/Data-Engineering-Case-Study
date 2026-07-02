@@ -41,6 +41,17 @@ func stateKey(stationID string, connectorID int) string {
 	return "station:" + stationID + ":" + strconv.Itoa(connectorID)
 }
 
+// stateKeyForEvent routes a HEARTBEAT (station-level liveness, connector 0) to its own
+// station_liveness:{id} namespace instead of station:{id}:0, which is shaped like a
+// connector-state key and would masquerade as connector 0. Every other event keeps its
+// per-connector station:{id}:{n} key.
+func stateKeyForEvent(e transform.Event) string {
+	if e.EventType == "HEARTBEAT" {
+		return "station_liveness:" + e.StationID
+	}
+	return stateKey(e.StationID, e.ConnectorID)
+}
+
 // deriveStatus returns the connector status ONLY from STATUS_CHANGE events, which are
 // the authoritative status timeline (the simulator emits one on every transition). The
 // other event types update power/soc/session but must not touch status: during a
@@ -90,7 +101,7 @@ func stateArgs(e transform.Event, ts time.Time, ttl time.Duration) []any {
 // Apply writes the connector's current state from this event. Returns false when the
 // event is stale (older than what's stored) and was therefore skipped.
 func (s *StateStore) Apply(ctx context.Context, e transform.Event, ts time.Time) (bool, error) {
-	key := stateKey(e.StationID, e.ConnectorID)
+	key := stateKeyForEvent(e)
 	res, err := casScript.Run(ctx, s.rdb, []string{key}, stateArgs(e, ts, s.ttl)...).Int()
 	if err != nil {
 		return false, err
@@ -117,7 +128,7 @@ func (s *StateStore) ApplyBatch(ctx context.Context, events []stateEvent) ([]boo
 	pipe := s.rdb.Pipeline()
 	cmds := make([]*redis.Cmd, len(events))
 	for i := range events {
-		key := stateKey(events[i].e.StationID, events[i].e.ConnectorID)
+		key := stateKeyForEvent(events[i].e)
 		cmds[i] = casScript.Eval(ctx, pipe, []string{key}, stateArgs(events[i].e, events[i].ts, s.ttl)...)
 	}
 	if _, err := pipe.Exec(ctx); err != nil {

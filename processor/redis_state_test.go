@@ -63,3 +63,18 @@ func TestStateArgs(t *testing.T) {
 		})
 	}
 }
+
+// TestStateKeyForEvent pins the F10 key routing: a HEARTBEAT is station-level liveness and
+// must land in its own station_liveness:{id} namespace, not the connector-shaped
+// station:{id}:0 that the connector-state readers scan; every other event keeps its
+// per-connector station:{id}:{n} key.
+func TestStateKeyForEvent(t *testing.T) {
+	hb := transform.Event{EventType: "HEARTBEAT", StationID: "TR-IST-0001", ConnectorID: 0}
+	if got, want := stateKeyForEvent(hb), "station_liveness:TR-IST-0001"; got != want {
+		t.Fatalf("HEARTBEAT key = %q, want %q", got, want)
+	}
+	conn := transform.Event{EventType: "METER_UPDATE", StationID: "TR-IST-0001", ConnectorID: 2}
+	if got, want := stateKeyForEvent(conn), "station:TR-IST-0001:2"; got != want {
+		t.Fatalf("connector key = %q, want %q", got, want)
+	}
+}

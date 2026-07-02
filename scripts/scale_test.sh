@@ -130,13 +130,20 @@ wait_healthy() {  # block until the stateful deps report healthy (bail after a b
     echo "    dependencies healthy"
 }
 
-preflight() {  # fail fast (exit 1) if the environment cannot produce trustworthy numbers
-    echo ">>> preflight: dependencies + scale presets"
+preflight_files() {  # fail fast (exit 1) if a scale preset is missing. Runs BEFORE the stack
+                     # is brought up -- it only reads local config, so it needs no services.
+    echo ">>> preflight: scale presets"
     local preset
     for preset in 1k 10k 50k 100k; do
         [ -f "config/scale-${preset}.yaml" ] \
             || { echo "ERROR: missing config/scale-${preset}.yaml" >&2; exit 1; }
     done
+    echo "    preflight files OK"
+}
+
+preflight_services() {  # fail fast (exit 1) if a dependency is unreachable. Runs AFTER the
+                        # stack is healthy -- these probes need the services already running.
+    echo ">>> preflight: dependencies"
     curl -sf localhost:9090/-/ready >/dev/null 2>&1 \
         || { echo "ERROR: Prometheus not ready at localhost:9090" >&2; exit 1; }
     $COMPOSE exec -T clickhouse clickhouse-client -u chargesquare --password chargesquare -q 'SELECT 1' >/dev/null 2>&1 \
@@ -148,7 +155,9 @@ preflight() {  # fail fast (exit 1) if the environment cannot produce trustworth
     echo "    preflight OK"
 }
 
-preflight
+# File checks need no running services, so they gate startup; the service-reachability
+# checks can only run once the stack is up (below, after wait_healthy).
+preflight_files
 
 # Clean slate so the 1k baseline measures steady state, not a drained backlog (F2).
 # Uses the already-built images (no --build).
@@ -156,6 +165,8 @@ echo ">>> resetting to clean slate (docker compose down -v && up -d)..."
 $COMPOSE down -v
 $COMPOSE up -d
 wait_healthy
+
+preflight_services
 
 echo "preset,target_eps,produced_eps,clean_eps,lag_p50,lag_p95,lag_p99,realtime_lag,analytics_lag,a1_ms,a4_ms,redis_ms" > "$OUT"
 

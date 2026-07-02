@@ -15,8 +15,8 @@ runnable against the live ClickHouse.
     (tariff × energy × time-of-day) taken from the billed `is_peak_priced` flag,
     not a re-derived clock hour
   - **A5** geographic distribution of FAULT events, deduped by `event_id`
-  - **A6** anomaly detection: sessions whose average power is > 2σ above the fleet mean
-    (bonus)
+  - **A6** anomaly detection: sessions whose average power is > 2σ above the fleet mean,
+    read with FINAL so duplicate METER_UPDATEs can't skew the average or z-scores (bonus)
 - `report.ipynb` runs A1–A6 against ClickHouse (HTTP, `:8123`) and charts each result
 - `output/` holds the generated results: `A1.csv … A6.csv` (one per query) plus a `.png`
   chart each
@@ -40,7 +40,7 @@ runs from the repo root or from `analytics/`; override the target with `CLICKHOU
   increment), never `SUM(energy_kwh)`, which would over-count by ~(readings per session).
   See `../docs/ARCHITECTURE.md` §6.
 - **Event-time windows.** The simulator runs with `time_acceleration > 1`, so the event
-  clock runs ahead of wall time. Time-windowed queries (A1/A4/A5) anchor to
+  clock runs ahead of wall time. Time-windowed queries (A1/A2/A4/A5) anchor to
   `max(timestamp)` in the data rather than `now()`, which would clip the window.
 - **Peak = billed, not derived.** A4's peak revenue comes from an `is_peak_priced` flag
   the simulator sets when it applies the peak multiplier, carried through to the clean

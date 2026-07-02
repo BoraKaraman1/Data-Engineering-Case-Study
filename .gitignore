@@ -8,6 +8,10 @@ processor/processor
 __pycache__/
 *.pyc
 
+# Python virtualenv (analytics: python3 -m venv .venv && .venv/bin/pip install -r analytics/requirements.txt)
+.venv/
+venv/
+
 # macOS
 .DS_Store
 
