@@ -11,6 +11,12 @@ That opens the Airflow UI at http://localhost:8081. The default stack
 profile so a broken or slow-to-pull Airflow container can never appear in the
 graded stack.
 
+The `airflow` service builds a small image from `deploy/airflow/Dockerfile`
+(base `apache/airflow:2.10.3-python3.12`) that bakes in the ClickHouse client
+(`clickhouse-connect`, pinned in `deploy/airflow/requirements.txt`). The
+dependency is installed once at image-build time, not re-installed on every
+container boot.
+
 ## What it does not touch
 
 It deliberately stays off the streaming path. The always-on consumers are
@@ -24,9 +30,11 @@ partitions on a schedule; it never sits in the ingest hot path.
 
 1. `freshness_check` is a data freshness gate: it fails the run if
    `ev.events_raw` is empty or its newest `ingested_at` is more than 24h old.
-2. `optimize_yesterday` runs `OPTIMIZE ... PARTITION <yyyymm> FINAL` on
-   yesterday's partition, so daytime reads stop paying the ReplacingMergeTree
-   FINAL cost. Per-partition only, never a full-table optimize.
+2. `optimize_closed_partition` runs `OPTIMIZE ... PARTITION <yyyymm> FINAL` on
+   the previous closed calendar month's partition, so reads stop paying the
+   ReplacingMergeTree FINAL cost. Partitions are monthly, so it never touches
+   the current (active) month and never runs a full-table optimize; it also
+   skips when that partition is already a single merged part.
 3. `reconcile_revenue` recomputes yesterday's revenue exactly from
    `events_raw FINAL` (each event counted once) and overwrites
    `revenue_hourly` for the day, correcting the approximate streaming MV.

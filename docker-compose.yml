@@ -207,13 +207,14 @@ services:
   # Airflow is published on 8081. clickhouse resolves on the default net. See
   # deploy/airflow/README.md.
   airflow:
-    image: apache/airflow:2.10.3
+    build:
+      context: ./deploy/airflow
+      dockerfile: Dockerfile
     profiles: ["airflow"]
     command: standalone
     ports:
       - "8081:8080"
     environment:
-      _PIP_ADDITIONAL_REQUIREMENTS: "clickhouse-connect==0.8.*"
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     volumes:
       - ./deploy/airflow/dags:/opt/airflow/dags:ro

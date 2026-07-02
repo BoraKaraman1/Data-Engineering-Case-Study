@@ -11,7 +11,6 @@ fires mid-grading. It is a normal Python file (not a Workflow sandbox), so
 datetime/now() are fine.
 """
 
-import bisect
 import logging
 import math
 from datetime import datetime, timedelta, timezone
@@ -81,12 +80,29 @@ def freshness_check(**_):
         )
 
 
-def optimize_yesterday(**_):
-    """t2: physically collapse yesterday's ReplacingMergeTree partition so
-    daytime reads stop paying the FINAL cost. Per-partition only, never a
-    full-table OPTIMIZE. A non-existent partition is a harmless no-op."""
+def optimize_closed_partition(**_):
+    """t2: physically collapse the PREVIOUS closed calendar month's
+    ReplacingMergeTree partition so reads stop paying the FINAL cost.
+    Partitions are monthly, so the current month is the active partition; this
+    compacts the previous closed month only -- never the active partition and
+    never a full-table OPTIMIZE. Skips when that partition is already a single
+    merged part (nothing to collapse)."""
     client = get_client()
-    yyyymm = (_now_utc().date() - timedelta(days=1)).strftime("%Y%m")
+    now = _now_utc()
+    first = now.replace(day=1)
+    prev = first - timedelta(days=1)
+    yyyymm = prev.strftime("%Y%m")
+
+    parts = client.query(
+        "SELECT count() FROM system.parts "
+        "WHERE database = 'ev' AND table = 'events_raw' AND active "
+        f"AND partition = '{yyyymm}'"
+    ).result_rows[0][0]
+    if parts < 2:
+        log.info("partition %s already compacted (%s parts), skipping",
+                 yyyymm, parts)
+        return
+
     client.command(f"OPTIMIZE TABLE ev.events_raw PARTITION {yyyymm} FINAL")
     log.info("optimized ev.events_raw partition %s FINAL", yyyymm)
 
@@ -128,33 +144,72 @@ def reconcile_revenue(**_):
     log.info("reconciled %s revenue_hourly rows for %s", reconciled, day)
 
 
-def _psi(expected, actual):
-    """Population Stability Index of `actual` vs `expected`, explicit and
-    dependency-free. Buckets are quantile edges of the EXPECTED distribution;
-    zero counts are floored to PSI_EPSILON so ln/division are safe. Returns
-    None when there is not enough data to bucket."""
-    if len(expected) < PSI_BUCKETS or not actual:
+def _value_subquery(metric, lo, hi):
+    """SQL producing a single column `v` for one metric over the window
+    [lo, hi). energy_delta mirrors A3's completed-session gate exactly (only
+    sessions with a START and a matching STOP; per-session max-min delta, never
+    SUM -- which excludes heartbeat/fault/status rows and empty sessions);
+    power_kw is per-row active-charging power."""
+    if metric == "energy_delta":
+        return (
+            "SELECT max(energy_kwh) - min(energy_kwh) AS v "
+            "FROM ev.events_raw FINAL "
+            "WHERE event_type IN ('SESSION_START','METER_UPDATE','SESSION_STOP') "
+            f"AND timestamp >= toDateTime('{lo}') AND timestamp < toDateTime('{hi}') "
+            "GROUP BY session_id "
+            "HAVING minIf(timestamp, event_type='SESSION_START') > toDateTime('1971-01-01') "
+            "AND maxIf(timestamp, event_type='SESSION_STOP') "
+            ">= minIf(timestamp, event_type='SESSION_START')"
+        )
+    return (
+        "SELECT power_kw AS v "
+        "FROM ev.events_raw "
+        "WHERE event_type='METER_UPDATE' AND power_kw > 0 "
+        f"AND timestamp >= toDateTime('{lo}') AND timestamp < toDateTime('{hi}')"
+    )
+
+
+def _bucket_edges(client, value_sql):
+    """9 interior quantile edges of the EXPECTED distribution, computed in
+    ClickHouse (memory-bounded TDigest -- one small row crosses the wire, never
+    the raw window). Returns a list of 9 floats, or None when the window is
+    empty or single-valued (too little data to bucket)."""
+    row = client.query(
+        "SELECT quantiles(0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9)(v) "
+        f"FROM ( {value_sql} )"
+    ).result_rows
+    if not row or row[0][0] is None:
         return None
+    edges = [float(e) for e in row[0][0]]
+    if not edges or any(e != e for e in edges) or len(set(edges)) < 2:
+        return None
+    return edges
 
-    exp_sorted = sorted(expected)
-    n = len(exp_sorted)
-    # Interior quantile edges (PSI_BUCKETS - 1 of them). Duplicate edges on a
-    # skewed distribution just yield empty buckets, which the epsilon floor
-    # handles.
-    edges = [exp_sorted[min(i * n // PSI_BUCKETS, n - 1)]
-             for i in range(1, PSI_BUCKETS)]
 
-    def bucketize(values):
-        counts = [0] * PSI_BUCKETS
-        for v in values:
-            counts[bisect.bisect_right(edges, v)] += 1
-        return counts
+def _bucket_counts(client, value_sql, edges):
+    """Bucket a window's values into PSI_BUCKETS using the expected-window
+    edges, entirely in ClickHouse (returns <= PSI_BUCKETS rows). Expands to a
+    length-PSI_BUCKETS count list; missing buckets are 0."""
+    edges_literal = "[" + ",".join(repr(e) for e in edges) + "]"
+    rows = client.query(
+        f"SELECT arraySum(arrayMap(e -> toUInt8(v >= e), {edges_literal})) "
+        "AS bucket, count() AS c "
+        f"FROM ( {value_sql} ) GROUP BY bucket ORDER BY bucket"
+    ).result_rows
+    counts = [0] * PSI_BUCKETS
+    for bucket, c in rows:
+        counts[bucket] = c
+    return counts
 
-    exp_counts = bucketize(expected)
-    act_counts = bucketize(actual)
-    exp_total = len(expected)
-    act_total = len(actual)
 
+def _psi_from_counts(exp_counts, act_counts):
+    """Explicit Population Stability Index from bucket COUNTS (not raw values).
+    Zero counts are floored to PSI_EPSILON so ln/division stay finite. Returns
+    None when either window is empty."""
+    exp_total = sum(exp_counts)
+    act_total = sum(act_counts)
+    if not exp_total or not act_total:
+        return None
     psi = 0.0
     for e, a in zip(exp_counts, act_counts):
         e_pct = max(e / exp_total, PSI_EPSILON)
@@ -163,16 +218,14 @@ def _psi(expected, actual):
     return psi
 
 
-def _column(client, sql):
-    return [r[0] for r in client.query(sql).result_rows if r[0] is not None]
-
-
 def dq_psi_gate(**_):
     """t4: data-quality drift. Compare the last 7 days (actual) against the
     prior 7 days (expected) for two distributions -- per-session energy delta
-    and per-row power_kw -- via an explicit PSI, and check the dead-letter
-    rate. Fail on PSI > threshold or DLQ rate > threshold. Skip PSI (do not
-    crash) when a window has too little data to bucket."""
+    and per-row power_kw -- via an explicit PSI computed from ClickHouse-side
+    bucket COUNTS (raw windows never leave ClickHouse), and check the
+    dead-letter rate. Fail on PSI > threshold or DLQ rate > threshold. Skip a
+    metric (do not crash) when its expected window has too little data to
+    bucket."""
     client = get_client()
     now = _now_utc()
     act_start = (now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
@@ -180,31 +233,23 @@ def dq_psi_gate(**_):
     exp_start = (now - timedelta(days=14)).strftime("%Y-%m-%d %H:%M:%S")
     exp_end = act_start
 
-    # (a) per-session energy delta (max-min): the energy-trap-safe measure,
-    #     never SUM(energy_kwh).
-    def energy_delta(lo, hi):
-        return _column(client,
-            "SELECT max(energy_kwh) - min(energy_kwh) AS delta "
-            "FROM ev.events_raw FINAL "
-            f"WHERE timestamp >= toDateTime('{lo}') AND timestamp < toDateTime('{hi}') "
-            "GROUP BY session_id")
-
-    # (b) per-row power for active charging.
-    def power(lo, hi):
-        return _column(client,
-            "SELECT power_kw FROM ev.events_raw FINAL "
-            f"WHERE timestamp >= toDateTime('{lo}') AND timestamp < toDateTime('{hi}') "
-            "AND event_type = 'METER_UPDATE' AND power_kw > 0")
-
     failed = []
-    for name, fn in (("energy_delta", energy_delta), ("power_kw", power)):
-        psi = _psi(fn(exp_start, exp_end), fn(act_start, act_end))
-        if psi is None:
-            log.info("PSI[%s]: skipped (not enough data in a 7-day window)", name)
+    for metric in ("energy_delta", "power_kw"):
+        exp_sql = _value_subquery(metric, exp_start, exp_end)
+        act_sql = _value_subquery(metric, act_start, act_end)
+        edges = _bucket_edges(client, exp_sql)
+        if edges is None:
+            log.info("PSI[%s]: skipped: not enough data", metric)
             continue
-        log.info("PSI[%s]=%.4f (threshold %.2f)", name, psi, PSI_THRESHOLD)
+        exp_counts = _bucket_counts(client, exp_sql, edges)
+        act_counts = _bucket_counts(client, act_sql, edges)
+        psi = _psi_from_counts(exp_counts, act_counts)
+        if psi is None:
+            log.info("PSI[%s]: skipped: not enough data", metric)
+            continue
+        log.info("PSI[%s]=%.4f (threshold %.2f)", metric, psi, PSI_THRESHOLD)
         if psi > PSI_THRESHOLD:
-            failed.append(f"{name} PSI={psi:.4f}")
+            failed.append(f"{metric} PSI={psi:.4f}")
 
     # Dead-letter rate over the actual (last-7-days) window.
     dlq = client.query(
@@ -264,7 +309,7 @@ with DAG(
     tags=["batch", "clickhouse"],
 ) as dag:
     t1 = PythonOperator(task_id="freshness_check", python_callable=freshness_check)
-    t2 = PythonOperator(task_id="optimize_yesterday", python_callable=optimize_yesterday)
+    t2 = PythonOperator(task_id="optimize_closed_partition", python_callable=optimize_closed_partition)
     t3 = PythonOperator(task_id="reconcile_revenue", python_callable=reconcile_revenue)
     t4 = PythonOperator(task_id="dq_psi_gate", python_callable=dq_psi_gate)
     t5 = PythonOperator(task_id="enforce_ttl", python_callable=enforce_ttl)
