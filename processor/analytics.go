@@ -47,7 +47,10 @@ func (h *analyticsHandler) flush(ctx context.Context, batch []kafka.Message) err
 			})
 			continue
 		}
-		valid = append(valid, validEvent{clean: transform.Flatten(e, ingestedAt), msgTime: batch[i].Time})
+		ce := transform.Flatten(e, ingestedAt)
+		// Stamp the produce->store-write lag anchor from the raw Kafka produce time.
+		ce.ProducedAt = batch[i].Time.UTC().Format(transform.TimeLayout)
+		valid = append(valid, validEvent{clean: ce, msgTime: batch[i].Time})
 	}
 
 	// In-batch dedup: keep the first occurrence of each event_id so intra-batch duplicates

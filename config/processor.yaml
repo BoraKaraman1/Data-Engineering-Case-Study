@@ -10,7 +10,8 @@ kafka:
                                      # so keep it small; at high volume batches fill by size first
 
 redis:
-  addr: "redis:6379"
+  addr:       "redis:6379"        # current-state store: noeviction, must-persist
+  dedup_addr: "redis-dedup:6379"  # dedup-key store: allkeys-lru, safe to evict
 
 postgres:
   dsn: "postgres://chargesquare:chargesquare@postgres:5432/chargesquare?sslmode=disable"
@@ -47,3 +48,17 @@ realtime:
                                      # is the low-load client-side floor. Applies the CAS across
                                      # the batch in ONE pipelined round trip, lifting the per-event
                                      # Redis-RTT ceiling (H2).
+
+readers:                             # per-group Kafka broker-fetch tuning (kafka-go otherwise
+                                     # defaults MaxWait to 10s, stalling a trickle reader)
+  realtime:                          # latency-first: fetch a lone event without waiting
+    min_bytes:   1                   # no fetch-size floor...
+    max_wait_ms: 50                  # ...and cap the fetch block so first-message latency stays
+                                     # well under the <1s realtime freshness SLO
+  analytics:                         # throughput-first: amortise broker round-trips under load
+    min_bytes:   10000               # wait for a ~10KB fetch floor...
+    max_wait_ms: 1000                # ...but bound the wait so trickle freshness isn't 10s either
+
+registry:
+  refresh_sec: 300                   # re-load the station/tariff roster every N seconds so new
+                                     # stations / tariff changes apply without a restart; 0 disables

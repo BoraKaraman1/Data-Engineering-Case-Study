@@ -27,13 +27,21 @@ func main() {
 	if err != nil {
 		log.Fatalf("registry: %v", err)
 	}
-	log.Printf("registry loaded: %d stations, %d tariffs", len(reg.stations), len(reg.tariffs))
+	log.Printf("registry loaded: %d stations, %d tariffs", reg.Len(), len(reg.snap.Load().tariffs))
 
-	rdb := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr})
-	if err := pingRedis(rdb); err != nil {
-		log.Fatalf("redis: %v", err)
+	// Two clients for two instances with opposite eviction policies: state must persist
+	// (noeviction), dedup may be LRU-evicted. See docker-compose.yml for the why.
+	stateRdb := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr})
+	if err := pingRedis(stateRdb); err != nil {
+		log.Fatalf("redis (state): %v", err)
 	}
-	defer rdb.Close()
+	defer stateRdb.Close()
+
+	dedupRdb := redis.NewClient(&redis.Options{Addr: cfg.Redis.DedupAddr})
+	if err := pingRedis(dedupRdb); err != nil {
+		log.Fatalf("redis (dedup): %v", err)
+	}
+	defer dedupRdb.Close()
 
 	m := NewMetrics()
 	StartMetricsServer(cfg.Metrics.Listen, cfg.Metrics.Pprof)
@@ -42,8 +50,8 @@ func main() {
 	writers := NewWriters(cfg)
 	defer writers.Close()
 
-	dedup := NewDeduper(rdb, time.Duration(cfg.Dedup.TTLSec)*time.Second)
-	state := NewStateStore(rdb, time.Duration(cfg.State.TTLSec)*time.Second)
+	dedup := NewDeduper(dedupRdb, time.Duration(cfg.Dedup.TTLSec)*time.Second)
+	state := NewStateStore(stateRdb, time.Duration(cfg.State.TTLSec)*time.Second)
 
 	rt := &realtimeHandler{reg: reg, state: state, m: m}
 	an := &analyticsHandler{reg: reg, dedup: dedup, writers: writers, m: m}
@@ -56,6 +64,12 @@ func main() {
 		log.Printf("shutdown signal received, draining...")
 		cancel()
 	}()
+
+	// Pick up new stations / tariff changes without a restart (0 disables).
+	if n := *cfg.Registry.RefreshSec; n > 0 {
+		log.Printf("registry refresh: every %ds", n)
+		go StartRegistryRefresher(ctx, reg, cfg.Postgres.DSN, time.Duration(n)*time.Second)
+	}
 
 	log.Printf("starting groups: realtime=%d analytics=%d on %q",
 		cfg.Workers.Realtime, cfg.Workers.Analytics, cfg.Kafka.TopicRaw)

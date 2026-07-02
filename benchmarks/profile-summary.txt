@@ -1,21 +1,31 @@
-Phase 4 CPU profile - processor under load (100k preset backlog drain)
-======================================================================
+Phase 4 CPU profile - PRE-BATCHING baseline (the bottleneck that motivated batching)
+====================================================================================
+This is the "BEFORE" profile. It was captured on the pre-batching processor -- the
+per-message produce/commit path -- when the 100k preset piled up a ~20-27M-event analytics
+backlog the processor then had to drain. It is the evidence that motivated the realtime +
+analytics micro-batching (commits 47d66eb, 988e95e), NOT a snapshot of the current pipeline.
 
-Command:
+The "AFTER" is benchmarks/results.csv: with batching, analytics lag at 100k is bounded to
+~10k events (~0.1 s of backlog), not 20M -- so this drain scenario no longer occurs. The
+symbols below are pre-refactor and no longer exist verbatim in the tree: main.runGroup.func1
+is now runAnalyticsBatchGroup / runRealtimeBatchGroup; main.(*realtimeHandler).handle is now
+applyBatch (one pipelined CAS per batch); kafka-go commitLoopImmediate was the per-message
+auto-commit, now an explicit CommitMessages after each durable batch (CommitInterval: 0).
+
+Command (on the pre-batching build):
   go tool pprof -top -seconds 20 http://localhost:9102/debug/pprof/profile
   (captured immediately after scripts/scale_test.sh, processor draining a
    ~20-27M-event analytics backlog; single-node dev-container Redpanda)
 
 Profile: cpu, 20s wall, 23.45s samples (117% -> multiple cores busy, NOT idle).
 
-Reading: the processor is I/O / network-syscall bound, not CPU-bound on the
-JSON transform. Flat time is dominated by the network write syscall; the
-cumulative view attributes it to (a) go-redis current-state writes on the
-realtime path, (b) kafka-go offset commit + produce on the analytics path,
-and (c) Snappy compression of the produce batches. encoding/json decode is a
-minor contributor (~6-8% cum). This matches BenchmarkFlattenValidate
-(~2.5 us/op): the transform is not the ceiling; the synchronous produce/commit
-I/O is.
+Reading: even before batching the processor was I/O / network-syscall bound, not CPU-bound
+on the JSON transform. Flat time is dominated by the network write syscall; the cumulative
+view attributes it to (a) go-redis current-state writes on the realtime path, (b) kafka-go
+offset commit + produce on the analytics path, and (c) Snappy compression of the produce
+batches. encoding/json decode is a minor contributor (~6-8% cum). This matched
+BenchmarkFlattenValidate (~2.5 us/op): the transform was never the ceiling; the SYNCHRONOUS
+PER-EVENT produce/commit I/O was -- exactly what batching then amortised.
 
 --- go tool pprof -top (flat, top 30) --------------------------------
 File: processor

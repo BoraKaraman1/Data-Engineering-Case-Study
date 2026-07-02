@@ -22,6 +22,9 @@ type Producer struct {
 
 	mu  sync.Mutex
 	rnd *rand.Rand
+
+	delay      *delayQueue
+	workerOnce sync.Once
 }
 
 func NewProducer(cfg *Config, m *Metrics) *Producer {
@@ -50,6 +53,7 @@ func NewProducer(cfg *Config, m *Metrics) *Producer {
 		dupRate: cfg.Simulator.DuplicateRate,
 		oooRate: cfg.Simulator.OutOfOrderRate,
 		rnd:     rand.New(rand.NewSource(cfg.Simulator.Seed + 1)),
+		delay:   newDelayQueue(),
 	}
 	if cfg.Simulator.TargetEventsPerSec > 0 {
 		p.limiter = rate.NewLimiter(rate.Limit(cfg.Simulator.TargetEventsPerSec), cfg.Simulator.TargetEventsPerSec)
@@ -95,20 +99,15 @@ func (p *Producer) Send(ctx context.Context, e Event) {
 	msg := kafka.Message{Key: []byte(e.StationID), Value: b}
 
 	// Out-of-order: hold this one and release after a short delay so later events
-	// overtake it on the partition. Cheap at small rates (one timer goroutine each).
+	// overtake it on the partition. Instead of a goroutine+timer per event (thousands
+	// could pile up at high ingest), hand it to one shared delay queue drained by a
+	// single worker. The worker binds to this Send's ctx; every Send runs under the
+	// same simulation ctx, so pending events still drop together on cancellation.
 	if p.chance(p.oooRate) {
 		p.metrics.OutOfOrder.Inc()
 		delay := time.Duration(2000+p.randInt(8000)) * time.Millisecond
-		go func() {
-			t := time.NewTimer(delay)
-			defer t.Stop()
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-			}
-			p.write(ctx, msg, e.EventType)
-		}()
+		p.workerOnce.Do(func() { go p.delay.worker(ctx, p.write) })
+		p.delay.push(delayedMsg{fireAt: time.Now().Add(delay), msg: msg, eventType: e.EventType})
 		return
 	}
 

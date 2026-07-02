@@ -50,7 +50,7 @@
     },
     {
       "id": 3,
-      "title": "End-to-end transport lag (p50 / p95 / p99)",
+      "title": "Clean-topic write lag (produce → clean topic)",
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
@@ -98,7 +98,7 @@
       "title": "Dead-letter rate",
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 24 },
       "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
       "targets": [
         {
@@ -114,7 +114,7 @@
       "title": "Reliability injections (dup / out-of-order)",
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 24 },
       "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
       "targets": [
         {
@@ -136,7 +136,7 @@
       "title": "Active charging sessions",
       "type": "stat",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 24 },
       "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
       "targets": [
         {
@@ -144,6 +144,34 @@
           "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "simulator_active_sessions",
           "legendFormat": "active sessions"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Realtime store-write lag (produce → Redis apply)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.5, sum(rate(processor_state_apply_lag_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.95, sum(rate(processor_state_apply_lag_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.99, sum(rate(processor_state_apply_lag_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99"
         }
       ]
     }

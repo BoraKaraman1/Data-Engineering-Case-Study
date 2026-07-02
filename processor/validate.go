@@ -56,6 +56,9 @@ func Validate(e transform.Event, reg *Registry) *ValidationError {
 	if e.EventID == "" {
 		return verr("missing_event_id", "missing event_id")
 	}
+	if !isValidEventID(e.EventID) {
+		return verr("bad_event_id", "malformed event_id %q", e.EventID)
+	}
 	if !validEventTypes[e.EventType] {
 		return verr("unknown_event_type", "unknown event_type %q", e.EventType)
 	}
@@ -165,6 +168,34 @@ func Validate(e transform.Event, reg *Registry) *ValidationError {
 		}
 	}
 	return nil
+}
+
+// isValidEventID reports whether s is a canonical hyphenated UUID: 36 characters, hyphens
+// at positions 8/13/18/23, hex digits everywhere else. The simulator always emits a real
+// uuid.NewString(), and event_id becomes a Redis dedup key and a ClickHouse row, so a
+// non-empty but malformed id is a corrupt event, not a real one. Kept dependency-free
+// (the processor deliberately pulls in no google/uuid) -- a shape check is enough here.
+func isValidEventID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if c != '-' {
+				return false
+			}
+			continue
+		}
+		if !isHexDigit(c) {
+			return false
+		}
+	}
+	return true
+}
+
+func isHexDigit(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 }
 
 func validateMeter(m *transform.Meter) *ValidationError {

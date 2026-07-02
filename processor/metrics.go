@@ -9,9 +9,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// Metrics are the processor's Prometheus signals. The wall-clock transport lag is the
-// Phase-4 SLO (acceleration-immune); ingestion_lag (ingested_at - event_time) is kept
-// but only meaningful at time_acceleration=1.
+// Metrics are the processor's Prometheus signals. The wall-clock store-write lags --
+// transport (produce -> clean-topic) and state_apply (produce -> Redis current-state) --
+// are the Phase-4 SLOs (acceleration-immune); ingestion_lag (ingested_at - event_time) is
+// kept but only meaningful at time_acceleration=1.
 type Metrics struct {
 	Consumed          *prometheus.CounterVec
 	CleanProduced     prometheus.Counter
@@ -22,6 +23,7 @@ type Metrics struct {
 	RedisErrors       *prometheus.CounterVec
 	TransportLag      prometheus.Histogram
 	IngestionLag      prometheus.Histogram
+	StateApplyLag     prometheus.Histogram
 	RedisWrite        *prometheus.HistogramVec
 	CleanProduce      prometheus.Histogram
 	AnalyticsBatch    prometheus.Histogram
@@ -36,7 +38,10 @@ type Metrics struct {
 }
 
 func NewMetrics() *Metrics {
-	subSecond := []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10}
+	// lagBuckets extends past 10s (20/30/60/120) so the produce->store-write lag
+	// histograms don't saturate at the top bucket under load -- p95/p99 stay real
+	// instead of pegging at 10 when a preset backs up.
+	lagBuckets := []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 20, 30, 60, 120}
 	redisB := []float64{.0001, .00025, .0005, .001, .0025, .005, .01, .025, .05, .1}
 	produceB := []float64{.0005, .001, .0025, .005, .01, .025, .05, .1, .25, .5, 1}
 	return &Metrics{
@@ -70,13 +75,18 @@ func NewMetrics() *Metrics {
 		}, []string{"op"}),
 		TransportLag: promauto.NewHistogram(prometheus.HistogramOpts{
 			Name:    "processor_transport_lag_seconds",
-			Help:    "Wall-clock lag from Kafka produce time to processing (acceleration-immune SLO).",
-			Buckets: subSecond,
+			Help:    "Wall-clock lag from Kafka produce time to the clean-topic write (analytics store-write SLO).",
+			Buckets: lagBuckets,
 		}),
 		IngestionLag: promauto.NewHistogram(prometheus.HistogramOpts{
 			Name:    "processor_ingestion_lag_seconds",
 			Help:    "Event-time to ingest lag; only meaningful at time_acceleration=1.",
-			Buckets: subSecond,
+			Buckets: lagBuckets,
+		}),
+		StateApplyLag: promauto.NewHistogram(prometheus.HistogramOpts{
+			Name:    "processor_state_apply_lag_seconds",
+			Help:    "Wall-clock lag from Kafka produce time to Redis current-state apply (realtime store-write SLO).",
+			Buckets: lagBuckets,
 		}),
 		RedisWrite: promauto.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "processor_redis_write_seconds",

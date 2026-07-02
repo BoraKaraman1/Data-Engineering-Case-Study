@@ -203,7 +203,7 @@ func stepGroup(ctx context.Context, group []*Station, now time.Time, dt time.Dur
 				if g.r.Float64() < faultProb {
 					// fault aborts the session: emit the fault, close out, go down
 					p.Send(ctx, st.faultAlert(c, now, g))
-					p.Send(ctx, st.stopSession(c, now))
+					p.Send(ctx, st.stopSession(c, now, cfg))
 					counter.stop()
 					c.status = "Faulted"
 					c.faultedUntil = now.Add(downtime(g))
@@ -212,7 +212,7 @@ func stepGroup(ctx context.Context, group []*Station, now time.Time, dt time.Dur
 				}
 				s := c.session
 				if now.After(s.EndsAt) || s.Soc >= 100 {
-					p.Send(ctx, st.stopSession(c, now))
+					p.Send(ctx, st.stopSession(c, effectiveStopAt(s, now), cfg))
 					counter.stop()
 					c.idleUntil = now.Add(idleGap(now, cfg, g))
 					p.Send(ctx, st.statusChange(c, now, "Available"))

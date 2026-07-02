@@ -26,6 +26,10 @@ double-count trap, path to production) is in **[docs/ARCHITECTURE.md](docs/ARCHI
 **Start here: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — the final report tying the
 whole pipeline together (design decisions, the measured scale curve, production path).
 
+**How it was hardened: [docs/REVIEW_LOG.md](docs/REVIEW_LOG.md)** — every finding from four
+independent code-review rounds (27 in all) with the fix or the reasoned decline, and how each
+was verified.
+
 ---
 
 ## Build status
@@ -197,7 +201,8 @@ measuring the pipeline.
 **Run the scale test:** `bash scripts/scale_test.sh` (override the windows with
 `WARMUP=120 MEASURE=90 bash scripts/scale_test.sh`). For each preset it recreates
 `registry-seed` -> `simulator` -> `processor` for the new roster, then records produced vs
-clean throughput, transport-lag percentiles, authoritative Redpanda consumer-group lag,
+clean throughput, the three wall-clock store-write-lag percentiles (produce -> clean-topic,
+-> Redis apply, -> ClickHouse queryable), authoritative Redpanda consumer-group lag,
 and A1/A4 query latency to **`benchmarks/results.csv`**. The checked-in results are the final
 tuned four-row curve (1k, 10k, 50k, 100k): analytics batching keeps `clean_eps` near input rate,
 realtime Redis batching keeps consumer-group lag bounded, and the 100k row supports the `<1 s`
@@ -208,24 +213,31 @@ path to 100k / production are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §
 
 ## Results
 
-Clean-topic throughput tracks the driven input rate the whole way up the curve —
-998.8182033053945 / 9998.254608923313 / 50208.66893329212 / 102658.74545454545 ev/s at
-the 1k / 10k / 50k / 100k presets. Realtime consumer-group lag stays bounded at every
-step (351 / 710 / 2281 / 12782 events, which at each preset's rate is well under a second
-of backlog), so current-state freshness holds under 1s. Full before/after batching
-analysis: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §11.
+Clean-topic throughput tracks the driven input rate the whole way up the curve — 1,001 /
+10,008 / 50,202 / 102,666 ev/s of validated, deduped output at the 1k / 10k / 50k / 100k
+presets. The pipeline is instrumented with **three wall-clock store-write lags** (all
+acceleration-immune, measured from the raw Kafka produce time): produce → clean-topic write,
+produce → Redis current-state apply, and produce → ClickHouse queryable. The realtime
+store-write (`rt_apply`) stays **sub-100 ms through 50k and 0.69 s p99 at 100k** — a direct
+measurement of the `<1 s` current-state freshness target, not an inference from consumer lag.
+ClickHouse freshness holds ~3–4 s (the Kafka-engine flush cadence) and consumer-group lag
+stays bounded (11,599 realtime events at 100k ≈ 0.11 s of backlog). Full before/after
+batching analysis: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §11.
 
-| preset | target_eps | produced_eps | clean_eps | lag_p50 | lag_p95 | lag_p99 | realtime_lag | analytics_lag | a1_ms | a4_ms | redis_ms |
-|--------|-----------|--------------|-----------|---------|---------|---------|--------------|---------------|-------|-------|----------|
-| 1k | 1000 | 1019.4888888888889 | 998.8182033053945 | 0.4285786376802818 | 10.0 | 10.0 | 351 | 466 | 23 | 17 | 88 |
-| 10k | 10000 | 10197.511111111111 | 9998.254608923313 | 0.17504045821204253 | 10.0 | 10.0 | 710 | 1353 | 129 | 57 | 88 |
-| 50k | 50000 | 51240.71111111111 | 50208.66893329212 | 0.08708749088729392 | 10.0 | 10.0 | 2281 | 2193 | 2104 | 803 | 92 |
-| 100k | 100000 | 104592.45555555556 | 102658.74545454545 | 4.39809260131872 | 10.0 | 10.0 | 12782 | 7633 | 8634 | 3195 | 141 |
+| preset | produced_eps | clean_eps | clean_lag s (p50/p95/p99) | rt_apply s (p50/p95/p99) | ch_fresh s | realtime_lag | analytics_lag | a1_ms | a4_ms | redis_ms |
+|-------:|-------------:|----------:|:-------------------------:|:------------------------:|:----------:|-------------:|--------------:|------:|------:|---------:|
+| 1k   | 1,019   | 1,001   | 0.39 / 0.93 / 0.99 | 0.038 / 0.049 / 0.050 | 3.9 | 44     | 419    | 24    | 12    | 89  |
+| 10k  | 10,196  | 10,008  | 0.17 / 0.25 / 0.76 | 0.038 / 0.049 / 0.050 | 2.7 | 385    | 1,394  | 109   | 74    | 90  |
+| 50k  | 51,207  | 50,202  | 0.08 / 0.23 / 0.25 | 0.038 / 0.049 / 0.097 | 3.5 | 1,263  | 4,326  | 1,368 | 703   | 85  |
+| 100k | 104,528 | 102,666 | 0.07 / 0.22 / 0.43 | 0.043 / 0.335 / 0.693 | 3.9 | 11,599 | 10,088 | 5,415 | 2,243 | 147 |
 
-*`*_eps` = events/sec; `lag_p50/p95/p99` = end-to-end transport lag in seconds;
-`realtime_lag`/`analytics_lag` = Kafka consumer-group backlog in events; `a1_ms`/`a4_ms`
-= ClickHouse server-side query time in ms; `redis_ms` = current-state point-read latency
-in ms.*
+*`*_eps` = events/sec. The three wall-clock **store-write lags** (accel-immune, from raw
+Kafka produce time): `clean_lag` = produce → durably on the clean topic (analytics path);
+`rt_apply` = produce → Redis current-state apply (realtime store-write SLO); `ch_fresh` =
+produce → queryable in ClickHouse (analytics store freshness, i.e. the Kafka-engine flush
+cadence). `realtime_lag`/`analytics_lag` = Kafka consumer-group backlog in events; `a1_ms`/
+`a4_ms` = ClickHouse server-side query time in ms; `redis_ms` = current-state point-read
+latency in ms (dominated by the `docker compose exec` spawn; a native `HGETALL` is sub-ms).*
 
 ## Batch layer (optional)
 

@@ -18,6 +18,8 @@ type Config struct {
 	Workers   WorkersConfig   `yaml:"workers"`
 	Analytics AnalyticsConfig `yaml:"analytics"`
 	Realtime  RealtimeConfig  `yaml:"realtime"`
+	Readers   ReadersConfig   `yaml:"readers"`
+	Registry  RegistryConfig  `yaml:"registry"`
 }
 
 type KafkaConfig struct {
@@ -31,8 +33,13 @@ type KafkaConfig struct {
 	LingerMs       int      `yaml:"linger_ms"`
 }
 
+// RedisConfig points at two instances: Addr is the current-state store (must-persist,
+// noeviction) and DedupAddr is the dedup-key store (evictable, allkeys-lru), split so a
+// dedup flood can't LRU-evict live state. DedupAddr falls back to Addr when unset, so a
+// single-Redis deployment still works.
 type RedisConfig struct {
-	Addr string `yaml:"addr"`
+	Addr      string `yaml:"addr"`
+	DedupAddr string `yaml:"dedup_addr"`
 }
 
 type PostgresConfig struct {
@@ -70,6 +77,29 @@ type RealtimeConfig struct {
 	BatchMaxWaitMs   int `yaml:"batch_max_wait_ms"`
 }
 
+// ReadersConfig splits the Kafka reader fetch tuning per consumer group so the latency-first
+// realtime group and the throughput-first analytics group no longer share one fetch floor.
+type ReadersConfig struct {
+	Realtime  readerTuning `yaml:"realtime"`
+	Analytics readerTuning `yaml:"analytics"`
+}
+
+// readerTuning is the per-group broker-fetch tuning: MinBytes is the fetch-size floor and
+// MaxWaitMs caps how long a fetch blocks waiting for that floor. kafka-go defaults MaxWait
+// to 10s, which stalls a low-traffic realtime reader's first message far past the freshness
+// SLO, so both are made explicit here.
+type readerTuning struct {
+	MinBytes  int `yaml:"min_bytes"`
+	MaxWaitMs int `yaml:"max_wait_ms"`
+}
+
+// RegistryConfig controls the periodic registry refresh. RefreshSec is a pointer so an
+// explicit 0 (disable) is distinguishable from an absent key (which defaults to 300);
+// main.go starts the refresher only when it is > 0.
+type RegistryConfig struct {
+	RefreshSec *int `yaml:"refresh_sec"`
+}
+
 // LoadConfig reads and parses the YAML config, filling in sane defaults.
 func LoadConfig(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
@@ -82,6 +112,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if len(c.Kafka.Brokers) == 0 {
 		return nil, fmt.Errorf("kafka.brokers is required")
+	}
+	if c.Redis.DedupAddr == "" {
+		c.Redis.DedupAddr = c.Redis.Addr // single-Redis fallback
 	}
 	if c.Dedup.TTLSec <= 0 {
 		c.Dedup.TTLSec = 120
@@ -109,6 +142,22 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if c.Realtime.BatchMaxWaitMs <= 0 {
 		c.Realtime.BatchMaxWaitMs = 25
+	}
+	if c.Readers.Realtime.MinBytes <= 0 {
+		c.Readers.Realtime.MinBytes = 1
+	}
+	if c.Readers.Realtime.MaxWaitMs <= 0 {
+		c.Readers.Realtime.MaxWaitMs = 50
+	}
+	if c.Readers.Analytics.MinBytes <= 0 {
+		c.Readers.Analytics.MinBytes = 10000
+	}
+	if c.Readers.Analytics.MaxWaitMs <= 0 {
+		c.Readers.Analytics.MaxWaitMs = 1000
+	}
+	if c.Registry.RefreshSec == nil {
+		def := 300
+		c.Registry.RefreshSec = &def
 	}
 	if c.Metrics.Listen == "" {
 		c.Metrics.Listen = ":9102"

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 #
 # Phase 4 scale test. Drives the simulator at increasing target rates and, at each
-# level, records production vs processed throughput, end-to-end transport lag
-# (p50/p95/p99), Kafka consumer-group lag for BOTH processor groups, and A1/A4 query
-# latency + a Redis point-read latency. Results append to benchmarks/results.csv.
+# level, records production vs processed throughput, THREE wall-clock store-write lags
+# (clean-topic write, Redis current-state apply, ClickHouse queryable freshness), Kafka
+# consumer-group lag for BOTH processor groups, and A1/A4 query latency + a Redis
+# point-read latency. Results append to benchmarks/results.csv.
 #
 # Throughput honesty:
 #   - produced_eps is the Redpanda RAW-topic offset delta over the measure window
@@ -98,6 +99,29 @@ print(max(1, int(float(t[-1]) * 1000)))
     echo "$ms"
 }
 
+ch_freshness_ms() {  # produce->ClickHouse-queryable store-write lag: now() - the newest queryable
+                     # produced_at (the raw Kafka produce wall-clock carried into events_raw), in ms.
+                     # An instantaneous gauge sampled 5x and medianed: at saturation the newest
+                     # queryable row is old, so freshness grows and honestly tracks the backlog.
+                     # Empty table -> 0. A query FAILURE is a hard error (the metric is required).
+    local i v samples
+    samples=""
+    for i in 1 2 3 4 5; do
+        if ! v="$($COMPOSE exec -T clickhouse clickhouse-client -u chargesquare --password chargesquare -q \
+            "SELECT toUInt64(greatest(ifNull(dateDiff('millisecond', max(produced_at), now64(3)), 0), 0)) FROM ev.events_raw" 2>/dev/null | tr -d '\r\n')"; then
+            echo "ERROR: ClickHouse freshness query failed" >&2
+            return 1
+        fi
+        samples="$samples $v"
+        sleep 1
+    done
+    printf '%s' "$samples" | python3 -c '
+import sys
+xs = sorted(int(x) for x in sys.stdin.read().split() if x.strip().isdigit())
+print(xs[len(xs)//2] if xs else 0)
+' || { echo "ERROR: could not median freshness samples" >&2; return 1; }
+}
+
 redis_read_ms() {  # wall-clock ms for a current-state point read (floored to 1ms). Optional
                    # sample: if no state key exists yet, report the 1ms floor rather than abort.
     local key t0 t1 dt
@@ -168,7 +192,7 @@ wait_healthy
 
 preflight_services
 
-echo "preset,target_eps,produced_eps,clean_eps,lag_p50,lag_p95,lag_p99,realtime_lag,analytics_lag,a1_ms,a4_ms,redis_ms" > "$OUT"
+echo "preset,target_eps,produced_eps,clean_eps,clean_lag_p50,clean_lag_p95,clean_lag_p99,rt_apply_p50,rt_apply_p95,rt_apply_p99,ch_fresh_ms,realtime_lag,analytics_lag,a1_ms,a4_ms,redis_ms" > "$OUT"
 
 for preset in "${PRESETS[@]}"; do
     cfg="/app/config/scale-${preset}.yaml"
@@ -202,16 +226,23 @@ for preset in "${PRESETS[@]}"; do
     fi
 
     clean="$(prom 'sum(rate(processor_clean_produced_total[1m]))')"
-    p50="$(prom 'histogram_quantile(0.5, sum(rate(processor_transport_lag_seconds_bucket[5m])) by (le))')"
-    p95="$(prom 'histogram_quantile(0.95, sum(rate(processor_transport_lag_seconds_bucket[5m])) by (le))')"
-    p99="$(prom 'histogram_quantile(0.99, sum(rate(processor_transport_lag_seconds_bucket[5m])) by (le))')"
+    # Store-write lag #1: produce -> durably in the clean topic (analytics path).
+    clean_p50="$(prom 'histogram_quantile(0.5, sum(rate(processor_transport_lag_seconds_bucket[5m])) by (le))')"
+    clean_p95="$(prom 'histogram_quantile(0.95, sum(rate(processor_transport_lag_seconds_bucket[5m])) by (le))')"
+    clean_p99="$(prom 'histogram_quantile(0.99, sum(rate(processor_transport_lag_seconds_bucket[5m])) by (le))')"
+    # Store-write lag #2: produce -> Redis current-state apply (realtime path SLO).
+    rt_p50="$(prom 'histogram_quantile(0.5, sum(rate(processor_state_apply_lag_seconds_bucket[5m])) by (le))')"
+    rt_p95="$(prom 'histogram_quantile(0.95, sum(rate(processor_state_apply_lag_seconds_bucket[5m])) by (le))')"
+    rt_p99="$(prom 'histogram_quantile(0.99, sum(rate(processor_state_apply_lag_seconds_bucket[5m])) by (le))')"
+    # Store-write lag #3: produce -> ClickHouse queryable (analytics store freshness).
+    ch_fresh_ms="$(ch_freshness_ms)"
     rt_lag="$(group_lag realtime)"
     an_lag="$(group_lag analytics)"
     a1_ms="$(ch_query_ms analytics/queries/A1_hourly_energy.sql)"
     a4_ms="$(ch_query_ms analytics/queries/A4_revenue.sql)"
     redis_ms="$(redis_read_ms)"
 
-    row="${preset},${target},${produced},${clean},${p50},${p95},${p99},${rt_lag},${an_lag},${a1_ms},${a4_ms},${redis_ms}"
+    row="${preset},${target},${produced},${clean},${clean_p50},${clean_p95},${clean_p99},${rt_p50},${rt_p95},${rt_p99},${ch_fresh_ms},${rt_lag},${an_lag},${a1_ms},${a4_ms},${redis_ms}"
     echo "    $row"
     echo "$row" >> "$OUT"
 done

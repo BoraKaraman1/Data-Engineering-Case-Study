@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS ev.events_queue
     session_id    String,
     timestamp     DateTime64(3, 'UTC'),
     ingested_at   DateTime64(3, 'UTC'),
+    produced_at   DateTime64(3, 'UTC'),
     operator_id   LowCardinality(String),
     lat           Float64,
     lon           Float64,
@@ -69,7 +70,8 @@ SETTINGS
 --    Partition: month of event-time (supports monthly/yearly retention + pruning).
 --    Order:     (station_id, connector_id, event_type, timestamp, event_id)
 --               -> station/connector locality for the analytics queries, with
---                  event_id last so the dedup key is unique per logical event.
+--                  event_id last: it is the LOGICAL id (unique per event), while the
+--                  physical dedup collapses the whole tuple, not event_id alone.
 --    Codecs:    DoubleDelta for monotonic timestamps, Gorilla for slowly-changing
 --               float sensor values (power/energy/voltage/current).
 -- ---------------------------------------------------------------------------
@@ -82,6 +84,10 @@ CREATE TABLE IF NOT EXISTS ev.events_raw
     session_id    String,
     timestamp     DateTime64(3, 'UTC') CODEC(DoubleDelta, ZSTD(1)),
     ingested_at   DateTime64(3, 'UTC') CODEC(DoubleDelta, ZSTD(1)),
+    -- Wall-clock Kafka produce time carried from the raw message (kafka.Message.Time).
+    -- Store-write lag = now() - produced_at; it is wall-clock so it stays valid under
+    -- time_acceleration>1 (unlike ingested_at - timestamp, which mixes sim and wall clocks).
+    produced_at   DateTime64(3, 'UTC') CODEC(DoubleDelta, ZSTD(1)),
     operator_id   LowCardinality(String),
     lat           Float64,
     lon           Float64,
@@ -114,7 +120,7 @@ SETTINGS index_granularity = 8192;
 CREATE MATERIALIZED VIEW IF NOT EXISTS ev.events_mv TO ev.events_raw AS
 SELECT
     event_id, event_type, station_id, connector_id, session_id,
-    timestamp, ingested_at, operator_id, lat, lon, city, country,
+    timestamp, ingested_at, produced_at, operator_id, lat, lon, city, country,
     power_kw, energy_kwh, voltage_v, current_a, soc_percent,
     vehicle_brand, vehicle_model, ev_id, tariff_id, cost_eur,
     error_code, component, status, is_peak_priced

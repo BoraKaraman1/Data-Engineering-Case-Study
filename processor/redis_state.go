@@ -70,8 +70,9 @@ func deriveStatus(e transform.Event) string {
 // with its parsed event time (the CAS last_seen comparand). ApplyBatch preserves input
 // (offset) order so the newest event per connector wins the CAS.
 type stateEvent struct {
-	e  transform.Event
-	ts time.Time
+	e        transform.Event
+	ts       time.Time
+	produced time.Time // Kafka produce wall-clock, for the realtime store-write lag histogram
 }
 
 // stateArgs builds the casScript arguments for one event: ARGV[1]=event ms, ARGV[2]=ttl ms,

@@ -51,7 +51,7 @@ func (h *realtimeHandler) applyBatch(ctx context.Context, batch []kafka.Message)
 		if terr != nil {
 			continue // already validated as parseable; stay safe
 		}
-		events = append(events, stateEvent{e: e, ts: ts})
+		events = append(events, stateEvent{e: e, ts: ts, produced: batch[i].Time})
 	}
 	if len(events) == 0 {
 		return
@@ -76,9 +76,15 @@ func (h *realtimeHandler) applyBatch(ctx context.Context, batch []kafka.Message)
 		}
 	}
 
+	// Observe the produce->apply store-write lag for events that actually landed (a stale
+	// event was superseded by a newer write, so it doesn't reflect current-state freshness).
+	// Measured after the CAS returns, so any retry backoff is included honestly.
+	applyNow := time.Now()
 	stale := 0
-	for _, ok := range applied {
-		if !ok {
+	for i, ok := range applied {
+		if ok {
+			h.m.StateApplyLag.Observe(applyNow.Sub(events[i].produced).Seconds())
+		} else {
 			stale++
 		}
 	}

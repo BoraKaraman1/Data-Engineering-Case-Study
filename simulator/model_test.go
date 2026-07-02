@@ -86,44 +86,220 @@ func TestOperatorsAssigned(t *testing.T) {
 	}
 }
 
-// stopSession must advance energy and SoC across the final interval since the last
-// METER_UPDATE before pricing; otherwise the SESSION_STOP total and its billed cost
-// undercount the tail of the session. Regression test for the F3 fix.
+// stopSession advances energy and SoC across the final interval since the last
+// METER_UPDATE before pricing, but only up to the planned EndsAt (a duration stop
+// fires on the tick AFTER EndsAt, so `now` overshoots) and only while the pack
+// isn't already full (chargingPower tapers to 8% of target at 100% SoC, not 0, so
+// an unguarded full-battery stop would still over-add). Regression for the F3 fix
+// plus the duration-cap / full-battery guards.
 func TestStopSessionAdvancesFinalInterval(t *testing.T) {
+	start := time.Date(2026, 1, 2, 10, 0, 0, 0, time.UTC) // 10:00 -> outside every peak window
+
+	// Shared model constants: 50 kW target, 60 kWh pack, standard-v1 @ 0.39/kWh
+	// (PeakMult 1.00, non-peak hour). Soc < 80 keeps chargingPower == 50 (no taper).
+	cases := []struct {
+		name        string
+		soc         float64
+		startEnergy float64
+		endsAt      time.Time
+		stop        time.Time
+		wantEnergy  float64
+		wantCost    float64
+	}{
+		{
+			// EndsAt in the future -> not capped; 50 kW * 0.1 h = 5 kWh added ->
+			// 15 kWh; 15 * 0.39 = 5.85.
+			name:        "advances final interval",
+			soc:         50,
+			startEnergy: 10,
+			endsAt:      start.Add(30 * time.Minute),
+			stop:        start.Add(6 * time.Minute),
+			wantEnergy:  round3(15.0),
+			wantCost:    round2(15.0 * 0.39),
+		},
+		{
+			// Full pack: chargingPower would still draw 50*0.08 = 4 kW, but the
+			// Soc >= 100 guard skips the add entirely -> energy unchanged at 40 kWh;
+			// 40 * 0.39 = 15.60.
+			name:        "full battery adds nothing",
+			soc:         100,
+			startEnergy: 40,
+			endsAt:      start.Add(30 * time.Minute),
+			stop:        start.Add(6 * time.Minute),
+			wantEnergy:  round3(40.0),
+			wantCost:    round2(40.0 * 0.39),
+		},
+		{
+			// Duration stops pass their effective timestamp (EndsAt) into stopSession:
+			// 50 kW * 0.1 h = 5 kWh -> 15 kWh; 15 * 0.39 = 5.85.
+			name:        "duration effective stop at EndsAt",
+			soc:         50,
+			startEnergy: 10,
+			endsAt:      start.Add(6 * time.Minute),
+			stop:        start.Add(6 * time.Minute),
+			wantEnergy:  round3(15.0),
+			wantCost:    round2(15.0 * 0.39),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &Station{ID: "TR-IST-0001", OperatorID: "ChargeSquare", City: "Istanbul", Country: "TR"}
+			conn := &Connector{ID: 1, PowerRating: 50, Type: "DC", status: "Charging"}
+			conn.session = &Session{
+				ID:            "sess-test",
+				BatteryKWh:    60,
+				TariffID:      "standard-v1",
+				StartedAt:     start,
+				EndsAt:        tc.endsAt,
+				Soc:           tc.soc,
+				TargetPowerKW: 50,
+				EnergyKWh:     tc.startEnergy,
+			}
+			conn.lastMeterAt = start
+
+			e := st.stopSession(conn, tc.stop, peakCfg())
+
+			if e.Meter.EnergyKWh != tc.wantEnergy {
+				t.Fatalf("stop energy = %v, want %v", e.Meter.EnergyKWh, tc.wantEnergy)
+			}
+			if e.CostEur != tc.wantCost {
+				t.Fatalf("stop cost = %v, want %v", e.CostEur, tc.wantCost)
+			}
+			wantTS := tc.stop.UTC().Format("2006-01-02T15:04:05.000Z07:00")
+			if e.Timestamp != wantTS {
+				t.Fatalf("stop timestamp = %q, want %q", e.Timestamp, wantTS)
+			}
+			if e.IsPeakPriced {
+				t.Fatalf("hour-10 stop must not be peak-priced")
+			}
+		})
+	}
+}
+
+func TestEffectiveStopAtForDurationStops(t *testing.T) {
+	base := time.Date(2026, 1, 2, 10, 0, 0, 0, time.UTC)
+	endsAt := base.Add(6 * time.Minute)
+	overshotTick := base.Add(10 * time.Minute)
+
+	cases := []struct {
+		name string
+		soc  float64
+		now  time.Time
+		want time.Time
+	}{
+		{"duration overshoot uses EndsAt", 50, overshotTick, endsAt},
+		{"full battery uses tick time", 100, overshotTick, overshotTick},
+		{"before EndsAt uses tick time", 50, base.Add(3 * time.Minute), base.Add(3 * time.Minute)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := effectiveStopAt(&Session{Soc: tc.soc, EndsAt: endsAt}, tc.now)
+			if !got.Equal(tc.want) {
+				t.Fatalf("effectiveStopAt = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDurationStopUsesEffectiveTimestampForPricing(t *testing.T) {
+	lastMeter := time.Date(2026, 1, 2, 16, 53, 0, 0, time.UTC)
+	endsAt := time.Date(2026, 1, 2, 16, 59, 0, 0, time.UTC)
+	observedTick := time.Date(2026, 1, 2, 17, 1, 0, 0, time.UTC)
+
 	st := &Station{ID: "TR-IST-0001", OperatorID: "ChargeSquare", City: "Istanbul", Country: "TR"}
 	conn := &Connector{ID: 1, PowerRating: 50, Type: "DC", status: "Charging"}
-	start := time.Date(2026, 1, 2, 10, 0, 0, 0, time.UTC) // 10:00 -> outside the 17-21 peak window
 	conn.session = &Session{
-		ID:            "sess-test",
+		ID:            "sess-boundary",
 		BatteryKWh:    60,
-		TariffID:      "standard-v1",
-		StartedAt:     start,
-		Soc:           50, // < 80 so chargingPower == TargetPowerKW (no taper crossing)
+		TariffID:      "peak-rate-v2",
+		StartedAt:     lastMeter.Add(-20 * time.Minute),
+		EndsAt:        endsAt,
+		Soc:           50,
 		TargetPowerKW: 50,
-		EnergyKWh:     10, // 10 kWh already metered before the final interval
+		EnergyKWh:     10,
 	}
-	conn.lastMeterAt = start
-	stop := start.Add(6 * time.Minute) // 0.1 h since the last meter tick
+	conn.lastMeterAt = lastMeter
 
-	e := st.stopSession(conn, stop)
+	stopAt := effectiveStopAt(conn.session, observedTick)
+	e := st.stopSession(conn, stopAt, peakCfg())
 
-	// Final interval: 50 kW * 0.1 h = 5 kWh added -> 15 kWh total.
-	if want := round3(15.0); e.Meter.EnergyKWh != want {
-		t.Fatalf("stop energy = %v, want %v (final interval not advanced)", e.Meter.EnergyKWh, want)
-	}
-	// standard-v1 base 0.39 EUR/kWh, off-peak hour -> 15 * 0.39 = 5.85.
-	if want := round2(15.0 * 0.39); e.CostEur != want {
-		t.Fatalf("stop cost = %v, want %v", e.CostEur, want)
+	wantTS := endsAt.UTC().Format("2006-01-02T15:04:05.000Z07:00")
+	if e.Timestamp != wantTS {
+		t.Fatalf("duration stop timestamp = %q, want %q", e.Timestamp, wantTS)
 	}
 	if e.IsPeakPriced {
-		t.Fatalf("10:00 stop must not be peak-priced")
+		t.Fatalf("duration stop at 16:59 must not be peak-priced even if observed at 17:01")
+	}
+	if e.CostEur != round2(15.0*0.49) {
+		t.Fatalf("duration stop cost = %v, want base-rate cost %v", e.CostEur, round2(15.0*0.49))
+	}
+}
+
+// peakCfg is a minimal config carrying the shipped peak windows (07-09, 17-20).
+// stopSession and pickTariff read only cfg.Simulator.PeakWindows for peak logic.
+func peakCfg() *Config {
+	return &Config{Simulator: SimulatorConfig{PeakWindows: []PeakWindow{
+		{Start: 7, End: 9, Weight: 3.0},
+		{Start: 17, End: 20, Weight: 3.5},
+	}}}
+}
+
+// is_peak_priced must be ECONOMIC, not clock-based: it is A4's peak-revenue
+// numerator, so it is set only when a real premium (PeakMult > 1) was billed, and
+// the window is config-sourced so BOTH peak windows (07-09, 17-20) price. Setting
+// lastMeterAt to the stop time zeroes the final-interval add, isolating pricing.
+func TestStopSessionPeakPricingIsEconomic(t *testing.T) {
+	const energy = 20.0 // no tail added, so billed energy == this
+
+	cases := []struct {
+		name     string
+		tariffID string
+		hour     int
+		wantPeak bool
+		wantCost float64
+	}{
+		{"peak tariff, evening window", "peak-rate-v2", 18, true, round2(energy * 0.49 * 1.35)},
+		{"peak tariff, morning window", "peak-rate-v2", 8, true, round2(energy * 0.49 * 1.35)},
+		{"peak tariff, outside window", "peak-rate-v2", 10, false, round2(energy * 0.49)},
+		{"standard billed at base in window", "standard-v1", 18, false, round2(energy * 0.39)},
+		{"fleet billed at base in window", "fleet-v1", 18, false, round2(energy * 0.34)},
+		{"off-peak discounted in window", "off-peak-v1", 18, false, round2(energy * 0.29 * 0.80)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stop := time.Date(2026, 1, 2, tc.hour, 0, 0, 0, time.UTC)
+			st := &Station{ID: "TR-IST-0001", OperatorID: "ChargeSquare", City: "Istanbul", Country: "TR"}
+			conn := &Connector{ID: 1, PowerRating: 50, Type: "DC", status: "Charging"}
+			conn.session = &Session{
+				ID:            "sess-test",
+				BatteryKWh:    60,
+				TariffID:      tc.tariffID,
+				StartedAt:     stop.Add(-20 * time.Minute),
+				Soc:           50,
+				TargetPowerKW: 50,
+				EnergyKWh:     energy,
+			}
+			conn.lastMeterAt = stop // no final-interval energy added
+
+			e := st.stopSession(conn, stop, peakCfg())
+
+			if e.IsPeakPriced != tc.wantPeak {
+				t.Fatalf("%s: IsPeakPriced = %v, want %v", tc.tariffID, e.IsPeakPriced, tc.wantPeak)
+			}
+			if e.CostEur != tc.wantCost {
+				t.Fatalf("%s: cost = %v, want %v", tc.tariffID, e.CostEur, tc.wantCost)
+			}
+		})
 	}
 }
 
 // Every id pickTariff can return must exist in tariffByID, else stopSession would
 // price against a zero-value Tariff (free energy). Guards the F6 single catalog.
 func TestPickTariffIDsInCatalog(t *testing.T) {
-	g := newRNG(1, &Config{})
+	g := newRNG(1, peakCfg())
 	for _, hour := range []int{9, 18} { // off-peak hour and the pickTariff peak branch
 		for i := 0; i < 1000; i++ {
 			id := g.pickTariff(hour)

@@ -7,7 +7,8 @@ import (
 )
 
 func testRegistry() *Registry {
-	return &Registry{
+	r := &Registry{}
+	r.snap.Store(&registrySnapshot{
 		stations: map[string]stationMeta{
 			"TR-IST-0001": {
 				numConnectors: 2,
@@ -19,12 +20,13 @@ func testRegistry() *Registry {
 			},
 		},
 		tariffs: map[string]struct{}{"standard-v1": {}},
-	}
+	})
+	return r
 }
 
 func validMeterUpdate() transform.Event {
 	return transform.Event{
-		EventID: "e1", EventType: "METER_UPDATE", StationID: "TR-IST-0001",
+		EventID: "a1b2c3d4-e5f6-7890-abcd-ef1234567890", EventType: "METER_UPDATE", StationID: "TR-IST-0001",
 		ConnectorID: 1, SessionID: "s1", Timestamp: "2026-07-01T09:59:00.000Z",
 		OperatorID: "ChargeSquare",
 		Location:   transform.Location{Lat: 41, Lon: 29, City: "Istanbul", Country: "TR"},
@@ -47,6 +49,8 @@ func TestValidateRules(t *testing.T) {
 		mut  func(e *transform.Event)
 	}{
 		{"missing event_id", "missing_event_id", func(e *transform.Event) { e.EventID = "" }},
+		{"too-long event_id", "bad_event_id", func(e *transform.Event) { e.EventID = "a1b2c3d4-e5f6-7890-abcd-ef1234567890x" }},
+		{"wrong-shape event_id", "bad_event_id", func(e *transform.Event) { e.EventID = "a1b2c3d4xe5f6-7890-abcd-ef1234567890" }},
 		{"unknown type", "unknown_event_type", func(e *transform.Event) { e.EventType = "NOPE" }},
 		{"unknown station", "unknown_station", func(e *transform.Event) { e.StationID = "TR-XXX-9999" }},
 		{"bad timestamp", "bad_timestamp", func(e *transform.Event) { e.Timestamp = "not-a-time" }},
@@ -76,7 +80,7 @@ func TestValidateRules(t *testing.T) {
 
 func TestHeartbeatConnectorMustBeZero(t *testing.T) {
 	e := transform.Event{
-		EventID: "h1", EventType: "HEARTBEAT", StationID: "TR-IST-0001", ConnectorID: 1,
+		EventID: "b2c3d4e5-f6a7-8901-bcde-f01234567890", EventType: "HEARTBEAT", StationID: "TR-IST-0001", ConnectorID: 1,
 		Timestamp: "2026-07-01T09:59:00.000Z", OperatorID: "ChargeSquare",
 		Location: transform.Location{Lat: 41, Lon: 29, City: "Istanbul", Country: "TR"},
 	}

@@ -61,13 +61,17 @@ type Event struct {
 // ---------------------------------------------------------------------------
 
 type CleanEvent struct {
-	EventID      string  `json:"event_id"`
-	EventType    string  `json:"event_type"`
-	StationID    string  `json:"station_id"`
-	ConnectorID  int     `json:"connector_id"`
-	SessionID    string  `json:"session_id"`
-	Timestamp    string  `json:"timestamp"`
-	IngestedAt   string  `json:"ingested_at"`
+	EventID     string `json:"event_id"`
+	EventType   string `json:"event_type"`
+	StationID   string `json:"station_id"`
+	ConnectorID int    `json:"connector_id"`
+	SessionID   string `json:"session_id"`
+	Timestamp   string `json:"timestamp"`
+	IngestedAt  string `json:"ingested_at"`
+	// ProducedAt is the wall-clock Kafka produce time, stamped by the analytics handler
+	// (analytics.go) from the raw message -- Flatten has no message context. It anchors the
+	// produce->store-write lag; being wall-clock it stays valid under time_acceleration>1.
+	ProducedAt   string  `json:"produced_at"`
 	OperatorID   string  `json:"operator_id"`
 	Lat          float64 `json:"lat"`
 	Lon          float64 `json:"lon"`

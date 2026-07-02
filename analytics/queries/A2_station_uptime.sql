@@ -60,7 +60,7 @@ SELECT
     sum(greatest(dateDiff('second', seg_start, seg_end), 0)) AS total_s,
     sumIf(greatest(dateDiff('second', seg_start, seg_end), 0), status = 'Faulted') AS downtime_s,
     round(1 - sumIf(greatest(dateDiff('second', seg_start, seg_end), 0), status = 'Faulted')
-             / sum(greatest(dateDiff('second', seg_start, seg_end), 0)), 4) AS uptime_ratio
+             / nullIf(sum(greatest(dateDiff('second', seg_start, seg_end), 0)), 0), 4) AS uptime_ratio  -- nullIf: 0 total_s (all segments zero-duration) -> NULL, not nan/inf
 FROM segments
 GROUP BY operator_id, station_id
 ORDER BY downtime_s DESC, operator_id

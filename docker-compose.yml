@@ -124,11 +124,36 @@ services:
       timeout: 5s
       retries: 20
 
+  # dedup and current-state have OPPOSITE eviction needs, so they get separate Redis
+  # instances instead of one shared cap. Dedup keys (dedup:<uuid>, 120s TTL) are write-once
+  # and safe to evict: ClickHouse's ReplacingMergeTree is the authoritative dedup backstop,
+  # so a lost key only lets a duplicate through for ClickHouse to collapse. Current-state
+  # hashes (station:<id>:<conn>, 300s TTL) have NO backstop -- Redis IS the store, so an
+  # early eviction silently breaks the "current status in the last 5 minutes" guarantee.
+  # One shared allkeys-lru instance would let a dedup flood (~12M keys at the 100k preset)
+  # evict live state. So: state = noeviction (below), dedup = allkeys-lru (redis-dedup).
   redis:
+    image: redis:7-alpine
+    # noeviction: a full instance errors new writes rather than dropping a live state key.
+    # The state working set is tiny (~100k small hashes even at the 100k roster), so 512mb
+    # never fills.
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "512mb", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Dedup-key store. allkeys-lru is correct here: evicting old dedup keys under memory
+  # pressure is safe (ClickHouse collapses any duplicate that slips through). 1gb sizes the
+  # dedup working set (~100k/s x 120s TTL).
+  redis-dedup:
     image: redis:7-alpine
     command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "1gb", "--maxmemory-policy", "allkeys-lru"]
     ports:
-      - "6379:6379"
+      - "6380:6379"
     healthcheck:
       test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
       interval: 5s
@@ -203,6 +228,8 @@ services:
       registry-seed:
         condition: service_completed_successfully
       redis:
+        condition: service_healthy
+      redis-dedup:
         condition: service_healthy
       clickhouse:
         condition: service_healthy

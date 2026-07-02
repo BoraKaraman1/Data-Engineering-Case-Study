@@ -12,7 +12,7 @@ import (
 func TestCleanEventKeysMatchSchema(t *testing.T) {
 	want := []string{
 		"event_id", "event_type", "station_id", "connector_id", "session_id",
-		"timestamp", "ingested_at", "operator_id", "lat", "lon", "city", "country",
+		"timestamp", "ingested_at", "produced_at", "operator_id", "lat", "lon", "city", "country",
 		"power_kw", "energy_kwh", "voltage_v", "current_a", "soc_percent",
 		"vehicle_brand", "vehicle_model", "ev_id", "tariff_id", "cost_eur",
 		"error_code", "component", "status", "is_peak_priced",

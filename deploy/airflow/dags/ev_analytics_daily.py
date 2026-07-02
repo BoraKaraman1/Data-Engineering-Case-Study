@@ -53,10 +53,19 @@ def _as_utc(dt):
     return dt
 
 
-def _yesterday_bounds():
-    """[start, end) of yesterday (UTC) as 'YYYY-MM-DD HH:MM:SS' strings, plus
-    the yesterday date object."""
-    today = _now_utc().date()
+def _reconcile_bounds(client):
+    """[start, end) of the previous full EVENT-TIME day as 'YYYY-MM-DD HH:MM:SS'
+    strings, plus the day object -- anchored to max(timestamp), NOT wall-clock.
+    reconcile_revenue filters the event-time `timestamp` column, so under the
+    simulator's accelerated clock a wall-clock 'yesterday' would target an empty
+    window -- the same reason the PSI gate and A1/A2/A4/A5 anchor to
+    max(timestamp). Returns None when the table is empty."""
+    anchor = client.query(
+        "SELECT max(timestamp) FROM ev.events_raw"
+    ).result_rows[0][0]
+    if anchor is None:
+        return None
+    today = _as_utc(anchor).date()
     day = today - timedelta(days=1)
     return day, f"{day} 00:00:00", f"{today} 00:00:00"
 
@@ -108,12 +117,19 @@ def optimize_closed_partition(**_):
 
 
 def reconcile_revenue(**_):
-    """t3: recompute yesterday's revenue EXACTLY from events_raw FINAL (each
-    event counted once, unlike the approximate streaming MV) and OVERWRITE
-    revenue_hourly for the day. The refreshable-view pattern (ARCHITECTURE
-    sec 10)."""
+    """t3: recompute the previous full EVENT-TIME day's revenue EXACTLY from
+    events_raw FINAL (each event counted once, unlike the approximate streaming
+    MV) and OVERWRITE revenue_hourly for that day. The refreshable-view pattern
+    (ARCHITECTURE sec 10). The window is anchored to max(timestamp) -- matching
+    the PSI gate and A1/A2/A4/A5 -- so it stays correct under the simulator's
+    accelerated event clock; a wall-clock 'yesterday' would reconcile an empty
+    window."""
     client = get_client()
-    day, start, end = _yesterday_bounds()
+    bounds = _reconcile_bounds(client)
+    if bounds is None:
+        log.info("reconcile skipped: ev.events_raw is empty")
+        return
+    day, start, end = bounds
 
     # Delete the approximate rows first; mutations_sync=2 makes it synchronous
     # so the insert below cannot race the delete (SummingMergeTree would
@@ -163,7 +179,7 @@ def _value_subquery(metric, lo, hi):
         )
     return (
         "SELECT power_kw AS v "
-        "FROM ev.events_raw "
+        "FROM ev.events_raw FINAL "
         "WHERE event_type='METER_UPDATE' AND power_kw > 0 "
         f"AND timestamp >= toDateTime('{lo}') AND timestamp < toDateTime('{hi}')"
     )
@@ -227,10 +243,21 @@ def dq_psi_gate(**_):
     metric (do not crash) when its expected window has too little data to
     bucket."""
     client = get_client()
-    now = _now_utc()
-    act_start = (now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
-    act_end = now.strftime("%Y-%m-%d %H:%M:%S")
-    exp_start = (now - timedelta(days=14)).strftime("%Y-%m-%d %H:%M:%S")
+
+    # PSI distributions filter on the EVENT-TIME column `timestamp`, so anchor
+    # the windows to max(timestamp) -- like A1/A2/A4/A5 -- to stay correct under
+    # the simulator's accelerated event-time (a wall-clock "last 7 days" can
+    # miss or mismatch the data). t1 already guards the empty table, but stay
+    # safe: skip the gate if there is no event-time anchor.
+    anchor = client.query(
+        "SELECT max(timestamp) FROM ev.events_raw"
+    ).result_rows[0][0]
+    if anchor is None:
+        log.info("PSI gate skipped: no event-time anchor in ev.events_raw")
+        return
+    act_start = (anchor - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+    act_end = anchor.strftime("%Y-%m-%d %H:%M:%S")
+    exp_start = (anchor - timedelta(days=14)).strftime("%Y-%m-%d %H:%M:%S")
     exp_end = act_start
 
     failed = []
@@ -251,16 +278,22 @@ def dq_psi_gate(**_):
         if psi > PSI_THRESHOLD:
             failed.append(f"{metric} PSI={psi:.4f}")
 
-    # Dead-letter rate over the actual (last-7-days) window.
+    # Two-clock split: the PSI windows above use the event-time anchor, but the
+    # dead-letter rate filters ingested_at (processing-time, stamped in real
+    # time at ingest; ev.dead_letter has no event-time column), so it stays on a
+    # wall-clock last-7-days window.
+    now = _now_utc()
+    dlq_start = (now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+    dlq_end = now.strftime("%Y-%m-%d %H:%M:%S")
     dlq = client.query(
         "SELECT count() FROM ev.dead_letter "
-        f"WHERE ingested_at >= toDateTime('{act_start}') "
-        f"AND ingested_at < toDateTime('{act_end}')"
+        f"WHERE ingested_at >= toDateTime('{dlq_start}') "
+        f"AND ingested_at < toDateTime('{dlq_end}')"
     ).result_rows[0][0]
     total = client.query(
         "SELECT count() FROM ev.events_raw "
-        f"WHERE ingested_at >= toDateTime('{act_start}') "
-        f"AND ingested_at < toDateTime('{act_end}')"
+        f"WHERE ingested_at >= toDateTime('{dlq_start}') "
+        f"AND ingested_at < toDateTime('{dlq_end}')"
     ).result_rows[0][0]
     dlq_rate = dlq / total if total else 0.0
     log.info("dead-letter rate=%.4f (%s/%s, threshold %.2f)",

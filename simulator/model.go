@@ -217,9 +217,22 @@ func (g *rng) pickVehicle() vehicleModel {
 	return vehicleFleet[0].m
 }
 
+// inPeakWindow reports whether hour falls in any configured peak window. Pricing
+// (stopSession) and tariff selection (pickTariff) both consult this so "peak"
+// means the SAME thing as the arrival weighting in timeWeight: the spec's peak
+// hours sourced from config, not a hardcoded literal.
+func inPeakWindow(hour int, cfg *Config) bool {
+	for _, w := range cfg.Simulator.PeakWindows {
+		if hour >= w.Start && hour < w.End {
+			return true
+		}
+	}
+	return false
+}
+
 func (g *rng) pickTariff(hour int) string {
 	// crude: peak hours skew toward the peak tariff
-	if hour >= 17 && hour < 21 {
+	if inPeakWindow(hour, g.cfg) {
 		if g.r.Float64() < 0.6 {
 			return "peak-rate-v2"
 		}
@@ -387,14 +400,23 @@ func (st *Station) meterTick(conn *Connector, now time.Time, g *rng) Event {
 	return e
 }
 
+func effectiveStopAt(s *Session, now time.Time) time.Time {
+	if s.Soc < 100 && s.EndsAt.Before(now) {
+		return s.EndsAt
+	}
+	return now
+}
+
 // stopSession ends a session and emits the SESSION_STOP with totals + cost.
-func (st *Station) stopSession(conn *Connector, now time.Time) Event {
+func (st *Station) stopSession(conn *Connector, now time.Time, cfg *Config) Event {
 	s := conn.session
 	// Advance energy/SoC across the final interval since the last METER_UPDATE
-	// (mirrors meterTick) so the SESSION_STOP total and its billed cost include
-	// the tail instead of undercounting it.
-	if dtHours := now.Sub(conn.lastMeterAt).Hours(); dtHours > 0 {
-		added := chargingPower(s) * dtHours
+	// (mirrors meterTick) so the stop total and billed cost include the tail.
+	// The caller passes the effective stop timestamp: duration stops pass EndsAt,
+	// while fault/full-battery stops pass the tick time. A full battery gets no
+	// extra tail energy because chargingPower still tapers to >0 at 100% SoC.
+	if s.Soc < 100 && now.After(conn.lastMeterAt) {
+		added := chargingPower(s) * now.Sub(conn.lastMeterAt).Hours()
 		s.EnergyKWh += added
 		s.Soc = math.Min(100, s.Soc+(added/s.BatteryKWh)*100)
 		conn.lastMeterAt = now
@@ -403,9 +425,14 @@ func (st *Station) stopSession(conn *Connector, now time.Time) Event {
 	t := tariffByID[s.TariffID]
 	rate := t.Base
 	peakPriced := false
-	if h := now.Hour(); h >= 17 && h < 21 {
+	// Window is config-sourced (same as pickTariff / arrival weighting). The
+	// multiplier still applies in-window for every tariff, but the flag is gated
+	// on a real premium: only PeakMult > 1 is peak-priced. standard/fleet bill at
+	// base (1.00) and off-peak is a discount (0.80), so those are NOT peak even
+	// in-window. A4's peak-revenue share reads this flag; a clock flag overstated it.
+	if inPeakWindow(now.Hour(), cfg) {
 		rate = t.Base * t.PeakMult
-		peakPriced = true
+		peakPriced = t.PeakMult > 1.0
 	}
 	cost := s.EnergyKWh * rate
 

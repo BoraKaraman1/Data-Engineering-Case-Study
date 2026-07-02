@@ -31,7 +31,7 @@ SELECT
     tariff_id,
     round(sum(cost_eur), 2) AS revenue_eur,
     round(sumIf(cost_eur, is_peak_priced = 1), 2) AS peak_revenue_eur,
-    round(100 * sumIf(cost_eur, is_peak_priced = 1) / sum(cost_eur), 1) AS peak_pct,
+    round(100 * sumIf(cost_eur, is_peak_priced = 1) / nullIf(sum(cost_eur), 0), 1) AS peak_pct,  -- nullIf: 0 revenue (all-zero-cost group) -> NULL, not nan/inf
     count() AS sessions
 FROM stops
 GROUP BY operator_id, city, tariff_id

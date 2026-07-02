@@ -30,13 +30,14 @@ type realtimeBatchSpec struct {
 	apply   func(ctx context.Context, batch []kafka.Message)
 }
 
-func newReader(cfg *Config, groupID string) *kafka.Reader {
+func newReader(cfg *Config, groupID string, tune readerTuning) *kafka.Reader {
 	return kafka.NewReader(kafka.ReaderConfig{
 		Brokers:        cfg.Kafka.Brokers,
 		GroupID:        groupID,
 		Topic:          cfg.Kafka.TopicRaw,
-		MinBytes:       10e3,
+		MinBytes:       tune.MinBytes,
 		MaxBytes:       10e6,
+		MaxWait:        time.Duration(tune.MaxWaitMs) * time.Millisecond,
 		CommitInterval: 0, // explicit synchronous commits
 		StartOffset:    kafka.FirstOffset,
 	})
@@ -98,7 +99,7 @@ func runAnalyticsBatchGroup(ctx context.Context, wg *sync.WaitGroup, cfg *Config
 		pollLagHere := i == 0 // one lag poller per group is enough (best-effort)
 		go func() {
 			defer wg.Done()
-			r := newReader(cfg, spec.groupID)
+			r := newReader(cfg, spec.groupID, cfg.Readers.Analytics)
 			defer func() { r.Close() }()
 			if pollLagHere {
 				go pollLag(ctx, r, m, spec.name)
@@ -126,7 +127,7 @@ func runAnalyticsBatchGroup(ctx context.Context, wg *sync.WaitGroup, cfg *Config
 					// (kafka-go only redelivers uncommitted offsets on a new generation),
 					// then retry. Only a durable-produce failure reaches here.
 					r.Close()
-					r = newReader(cfg, spec.groupID)
+					r = newReader(cfg, spec.groupID, cfg.Readers.Analytics)
 					time.Sleep(200 * time.Millisecond)
 					continue
 				}
@@ -147,7 +148,9 @@ func runAnalyticsBatchGroup(ctx context.Context, wg *sync.WaitGroup, cfg *Config
 // leaves ample budget for the CAS pipeline + Redis RTT. N (batch_max_messages) caps tail
 // latency; T (batch_max_wait_ms) bounds how long an already-open batch waits client-side, so a
 // fetched event is applied within T instead of stalling until N fills. (T governs client-side
-// accumulation only; the shared reader's MinBytes is a separate broker-fetch floor at trickle.)
+// accumulation only; the realtime reader is tuned separately -- MinBytes=1, MaxWait~50ms via
+// cfg.Readers.Realtime -- so a lone trickle event is fetched and applied promptly instead of
+// stalling on kafka-go's 10s broker-fetch default, which the old shared reader hit at trickle.)
 func runRealtimeBatchGroup(ctx context.Context, wg *sync.WaitGroup, cfg *Config, m *Metrics, spec realtimeBatchSpec) {
 	size := cfg.Realtime.BatchMaxMessages
 	window := time.Duration(cfg.Realtime.BatchMaxWaitMs) * time.Millisecond
@@ -156,7 +159,7 @@ func runRealtimeBatchGroup(ctx context.Context, wg *sync.WaitGroup, cfg *Config,
 		pollLagHere := i == 0 // one lag poller per group is enough (best-effort)
 		go func() {
 			defer wg.Done()
-			r := newReader(cfg, spec.groupID)
+			r := newReader(cfg, spec.groupID, cfg.Readers.Realtime)
 			defer r.Close()
 			if pollLagHere {
 				go pollLag(ctx, r, m, spec.name)
