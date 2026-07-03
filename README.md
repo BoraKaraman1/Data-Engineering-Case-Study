@@ -65,12 +65,12 @@ docker compose up --build
 
 Services:
 
-| Service | URL | Notes |
-|--------|-----|-------|
+| Service | Address | Notes |
+|--------|---------|-------|
 | Redpanda Console | http://localhost:8080 | inspect topics, partitions, live messages |
-| ClickHouse HTTP | http://localhost:8123 | user `chargesquare` / pass `chargesquare`, db `ev` |
-| Postgres | localhost:5432 | `chargesquare` / `chargesquare` |
-| Redis | localhost:6379 | |
+| ClickHouse HTTP | http://localhost:8123/play | browser SQL console (bare `:8123` returns `Ok.`); user `chargesquare` / pass `chargesquare`, db `ev` |
+| Postgres | `localhost:5432` | TCP, connect with `psql` (not a browser); `chargesquare` / `chargesquare` |
+| Redis | `localhost:6379` | TCP, connect with `redis-cli` (not a browser) |
 | Prometheus | http://localhost:9090 | |
 | Grafana | http://localhost:3000 | `admin` / `admin` |
 | Simulator metrics | http://localhost:9101/metrics | |
@@ -85,6 +85,8 @@ clean-topic write lag and realtime store-write lag (p50/p95/p99), authoritative 
 consumer-group lag per group (from Redpanda), active charging sessions, the dead-letter rate,
 and the duplicate / out-of-order reliability injections. It reads the same Prometheus metrics
 the Phase-4 scale test records, so the dashboard and `benchmarks/results.csv` share one source.
+
+![Grafana ops-pipeline dashboard: throughput, lag percentiles, consumer-group lag, active sessions](docs/screenshots/grafana-ops-dashboard.png)
 
 ---
 
@@ -107,6 +109,8 @@ You should see nested JSON: `SESSION_START`, a stream of `METER_UPDATE`s with a
 *cumulative* `energy_kwh` and rising `soc_percent`, `HEARTBEAT`s, the occasional
 `FAULT_ALERT`, and `SESSION_STOP` carrying `cost_eur`. Or browse them in the
 Redpanda Console at http://localhost:8080.
+
+![Nested raw charging events in the Redpanda Console](docs/screenshots/redpanda-console.png)
 
 **3. The registry seeded into Postgres:**
 
@@ -139,6 +143,8 @@ proving no duplicates survive (Redis dedup + ReplacingMergeTree):
 docker compose exec clickhouse clickhouse-client -u chargesquare --password chargesquare \
   -q "select count(), uniqExact(event_id) from ev.events_raw"
 ```
+
+![count() equals uniqExact(event_id): injected duplicates do not survive](docs/screenshots/clickhouse-dedup.png)
 
 **3. Redis current-state.** A hash per connector; `TTL` ≤ 300 is the 5-minute freshness
 window (key exists ⟺ seen in the last 5 min):
