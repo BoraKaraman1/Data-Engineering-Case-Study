@@ -4,7 +4,7 @@ This pipeline was built in phases and then hardened across several independent,
 adversarial code-review passes before submission. This log records each round, every
 finding, and the response.
 
-It deliberately includes the findings we **declined** and the reasoning for each. A
+It deliberately includes the findings that were **declined** and the reasoning for each. A
 reviewed system is defined as much by what it refuses to change as by what it fixes. Each
 finding was triaged against the design; some were implemented, some were declined as
 trade-offs.
@@ -280,7 +280,7 @@ artifacts**. Documented rather than built.
 
 ---
 
-## Why this matters for a reviewer
+## Why this matters
 
 The hard parts of this case are correctness under real distributed-systems conditions:
 at-least-once dedup, late/out-of-order arrival, the two-store split, and the cumulative-energy
