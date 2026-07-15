@@ -34,7 +34,7 @@ func BenchmarkFlattenValidate(b *testing.B) {
 		if derr != nil {
 			b.Fatal(derr)
 		}
-		if verr := Validate(e, reg); verr != nil {
+		if _, verr := Validate(e, reg); verr != nil {
 			b.Fatal(verr)
 		}
 		_ = transform.Flatten(e, now)

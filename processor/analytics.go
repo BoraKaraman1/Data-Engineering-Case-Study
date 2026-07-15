@@ -28,6 +28,7 @@ type analyticsHandler struct {
 type validEvent struct {
 	clean   transform.CleanEvent
 	msgTime time.Time // Kafka produce time, for the wall-clock transport-lag SLO
+	ts      time.Time // event time, parsed once by Validate, for the ingestion-lag metric
 }
 
 func (h *analyticsHandler) flush(ctx context.Context, batch []kafka.Message) error {
@@ -38,8 +39,9 @@ func (h *analyticsHandler) flush(ctx context.Context, batch []kafka.Message) err
 	var dlqItems []dlqItem
 	for i := range batch {
 		e, verr := Decode(batch[i].Value)
+		var ts time.Time
 		if verr == nil {
-			verr = Validate(e, h.reg)
+			ts, verr = Validate(e, h.reg)
 		}
 		if verr != nil {
 			dlqItems = append(dlqItems, dlqItem{
@@ -50,7 +52,7 @@ func (h *analyticsHandler) flush(ctx context.Context, batch []kafka.Message) err
 		ce := transform.Flatten(e, ingestedAt)
 		// Stamp the produce->store-write lag anchor from the raw Kafka produce time.
 		ce.ProducedAt = batch[i].Time.UTC().Format(transform.TimeLayout)
-		valid = append(valid, validEvent{clean: ce, msgTime: batch[i].Time})
+		valid = append(valid, validEvent{clean: ce, msgTime: batch[i].Time, ts: ts})
 	}
 
 	// In-batch dedup: keep the first occurrence of each event_id so intra-batch duplicates
@@ -118,9 +120,7 @@ func (h *analyticsHandler) flush(ctx context.Context, batch []kafka.Message) err
 		ce := valid[i].clean
 		h.m.Consumed.WithLabelValues("analytics", ce.EventType).Inc()
 		h.m.TransportLag.Observe(time.Since(valid[i].msgTime).Seconds())
-		if ts, err := time.Parse(time.RFC3339, ce.Timestamp); err == nil {
-			h.m.IngestionLag.Observe(ingestedAt.Sub(ts).Seconds())
-		}
+		h.m.IngestionLag.Observe(ingestedAt.Sub(valid[i].ts).Seconds())
 	}
 	if d := intraDupes + crossDupes; d > 0 {
 		h.m.DuplicatesDropped.Add(float64(d))

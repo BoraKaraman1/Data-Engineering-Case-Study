@@ -40,13 +40,6 @@ type Registry struct {
 	snap atomic.Pointer[registrySnapshot]
 }
 
-// Station returns the station's connector count, preserving the pre-metadata signature so
-// existing callers (validate.go's connector-range check) are unaffected.
-func (r *Registry) Station(id string) (int, bool) {
-	m, ok := r.snap.Load().stations[id]
-	return m.numConnectors, ok
-}
-
 // StationMeta returns the full registry row for referential cross-checks.
 func (r *Registry) StationMeta(id string) (stationMeta, bool) {
 	m, ok := r.snap.Load().stations[id]

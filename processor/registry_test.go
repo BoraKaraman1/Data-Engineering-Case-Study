@@ -30,13 +30,13 @@ func TestRegistrySwapVisibility(t *testing.T) {
 	r := &Registry{}
 	r.snap.Store(snapV1())
 
-	if n, ok := r.Station("TR-IST-0001"); !ok || n != 2 {
-		t.Fatalf("v1: Station(TR-IST-0001) = %d,%v; want 2,true", n, ok)
+	if m, ok := r.StationMeta("TR-IST-0001"); !ok || m.numConnectors != 2 {
+		t.Fatalf("v1: StationMeta(TR-IST-0001).numConnectors = %d,%v; want 2,true", m.numConnectors, ok)
 	}
 	if r.Len() != 1 {
 		t.Fatalf("v1: Len = %d; want 1", r.Len())
 	}
-	if _, ok := r.Station("TR-ANK-0007"); ok {
+	if _, ok := r.StationMeta("TR-ANK-0007"); ok {
 		t.Fatalf("v1: TR-ANK-0007 should be absent")
 	}
 	if r.TariffKnown("night-v2") {
@@ -45,11 +45,11 @@ func TestRegistrySwapVisibility(t *testing.T) {
 
 	r.snap.Store(snapV2())
 
-	if n, ok := r.Station("TR-IST-0001"); !ok || n != 4 {
-		t.Fatalf("v2: Station(TR-IST-0001) = %d,%v; want 4,true", n, ok)
+	if m, ok := r.StationMeta("TR-IST-0001"); !ok || m.numConnectors != 4 {
+		t.Fatalf("v2: StationMeta(TR-IST-0001).numConnectors = %d,%v; want 4,true", m.numConnectors, ok)
 	}
-	if n, ok := r.Station("TR-ANK-0007"); !ok || n != 6 {
-		t.Fatalf("v2: Station(TR-ANK-0007) = %d,%v; want 6,true", n, ok)
+	if m, ok := r.StationMeta("TR-ANK-0007"); !ok || m.numConnectors != 6 {
+		t.Fatalf("v2: StationMeta(TR-ANK-0007).numConnectors = %d,%v; want 6,true", m.numConnectors, ok)
 	}
 	if m, ok := r.StationMeta("TR-ANK-0007"); !ok || m.city != "Ankara" {
 		t.Fatalf("v2: StationMeta(TR-ANK-0007).city = %q,%v; want Ankara,true", m.city, ok)
@@ -85,7 +85,7 @@ func TestRegistryConcurrentSwap(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < iters; i++ {
-				r.Station("TR-IST-0001")
+				r.StationMeta("TR-IST-0001")
 				r.StationMeta("TR-ANK-0007")
 				r.TariffKnown("standard-v1")
 				_ = r.Len()
@@ -108,8 +108,8 @@ func TestRegistryRefreshKeepsOldOnFailure(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected Refresh to fail against a closed port")
 	}
-	if n, ok := r.Station("TR-IST-0001"); !ok || n != 2 {
-		t.Fatalf("after failed refresh: Station = %d,%v; want 2,true (old snapshot kept)", n, ok)
+	if m, ok := r.StationMeta("TR-IST-0001"); !ok || m.numConnectors != 2 {
+		t.Fatalf("after failed refresh: StationMeta = %d,%v; want 2,true (old snapshot kept)", m.numConnectors, ok)
 	}
 	if r.Len() != 1 {
 		t.Fatalf("after failed refresh: Len = %d; want 1 (old snapshot kept)", r.Len())

@@ -1,8 +1,8 @@
 # Code-Review & Hardening Log
 
 This pipeline was built in phases and then hardened across several independent,
-adversarial code-review passes before submission. This log records each round, every
-finding, and the response.
+adversarial code-review passes before and after submission. This log records each round,
+every finding, and the response.
 
 It deliberately includes the findings that were **declined** and the reasoning for each. A
 reviewed system is defined as much by what it refuses to change as by what it fixes. Each
@@ -44,17 +44,85 @@ A finding is not "fixed" until something objective proves it:
 | R4 | Pre-submission review (external review) | 9 + `is_late` eval | 7 | 3 |
 | R5 | Post-re-measurement review (external review) | 4 | 4 | 0 |
 | R6 | External review (working tree) | 2 | 1 | 1 |
+| R7 | Post-submission anti-pattern audit (3 parallel reviewers) | 7 | 3 | 4 |
 
-**33 review findings across six rounds, plus one feature-request evaluation. 30
-implemented, 4 deliberately declined** and documented below. Fixes from later reviews caught
+**40 review findings across seven rounds, plus one feature-request evaluation. 33
+implemented, 8 deliberately declined** and documented below. Fixes from later reviews caught
 gaps in earlier ones: F3 was refined by R3's `stopSession` fix; R4's freshness claim (2.1)
 exposed a measurement problem; R4's store-write-lag changes left artifacts stale, caught in
-R5; R3's PSI event-time anchor was extended to `reconcile_revenue` in R6. The iteration
-shows the cumulative effect of each round.
+R5; R3's PSI event-time anchor was extended to `reconcile_revenue` in R6; R7 caught a latent
+race the R4 5.1 registry refresh had made possible. The iteration shows the cumulative
+effect of each round.
 
 ---
 
-## R6 — External review (most recent)
+## R7 — Post-submission anti-pattern audit (most recent)
+
+Three independent reviewers swept the codebase in parallel — one each over the processor,
+the simulator, and the SQL/DAG/harness layer — hunting a specific defect class: duplicated
+logic, redundant data fetches, redundant passes, missing projections, and copy-paste
+compounding. Seven material findings: three fixed, four declined. Two categories also came
+back clean across all three sweeps: no `SELECT *` or over-fetching anywhere (every scan
+projects named columns), and no per-item calls where a batch API exists.
+
+### Fixed
+
+**Validation fetched the same station twice — and a comment claimed it was safe (Medium).**
+`Validate` called `reg.Station()` for the connector count and then `reg.StationMeta()` for
+the referential cross-check: two independent `snap.Load()`s for one station. A concurrent
+registry refresh (R4 5.1) could swap the snapshot between them, so a station removed
+mid-reseed would be judged against a zero-value row and dead-lettered as
+`operator_mismatch` instead of `unknown_station` — while the comment asserted the second
+lookup "cannot miss", an invariant two separate atomic loads do not provide. *Fix:* a
+single `StationMeta` read serves both checks (`numConnectors` was already in the row); the
+now-unused `Station` accessor was removed and its tests migrated to `StationMeta`.
+Verified: `gofmt`/`go vet` clean, `go test -race` green on both modules.
+
+**Event timestamp parsed up to three times per event (Medium, hot path).** `Validate`
+parsed the RFC3339 timestamp and discarded the result; both consumer paths then re-parsed
+the identical string — the realtime copy even carried a `// stay safe` guard for a parse
+that could no longer fail. At target load that is thousands of redundant parses per second
+across the two groups. *Fix:* `Validate` now returns the parsed `time.Time`; both handlers
+consume it, the dead re-parse branch is gone, and the accept-path unit test pins the
+returned value.
+
+**Wire-struct tag drift between the mirrored schemas (Low).** R4 4.1 accepted the
+simulator/processor schema mirroring as a deliberate contract boundary, guarded by a
+field-name test — and the one thing that guard cannot see had drifted:
+`is_peak_priced,omitempty` in the simulator vs no `omitempty` in the processor.
+Behaviourally inert today (the processor only ever decodes this struct; the DLQ writes raw
+bytes), but drift on a documented boundary should be zero. *Fix:* tags aligned on the
+decode side — a no-op by construction, confirmed by build + tests.
+
+### Declined (documented, not implemented)
+
+**A2 scans `events_raw FINAL` twice.** The uptime query reads STATUS_CHANGE rows through
+two UNION ALL branches (in-window segments vs carried-forward pre-window state), paying
+the expensive `FINAL` twice. A single scan bounded at `win_end` with
+`greatest(ts, win_start)` clamping yields the same segments in one pass. Declined: the
+query is measured correct, the two-branch form states the carried-forward intent
+explicitly, and rewriting it needs live re-verification for a query that is not a
+bottleneck. The single-scan form is the named optimisation if A2 ever grows slow.
+
+**Shared `events` package for the mirrored wire structs.** Re-raised by this audit; the
+R4 4.1 decision stands (a schema *contract*, not compile-time coupling), now with the tag
+alignment above and the schema registry still the production answer.
+
+**The `max(timestamp)` window anchor exists in six places** (four A-queries, two DAG
+helpers), each with its own copy of the rationale comment. A shared `ev.event_anchor` view
+would single-source it, but the A-queries are deliberately standalone files (the scale
+harness executes them verbatim) and all six sites are pinned by tests and CI. Deferred,
+with the view named as the fix.
+
+**Simulator-internal duplication.** Connector-status literals appear ~16 times across the
+`stepGroup`/model split of the status state machine, `stopSession` mirrors `meterTick`'s
+integration step, and `heartbeat` inlines `baseEvent`. All cold-path or already
+correctness-tested (R3's `stopSession` table test, the pricing tests); consolidating is
+real cleanup but pure churn risk in support code.
+
+---
+
+## R6 — External review
 
 An independent pass over the working tree identified two issues the R5 round had not covered,
 both in the batch / consumer layer: one Medium correctness bug and one Medium resilience

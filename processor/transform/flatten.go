@@ -51,7 +51,7 @@ type Event struct {
 	CostEur      float64  `json:"cost_eur,omitempty"`
 	Fault        *Fault   `json:"fault,omitempty"`
 	Status       string   `json:"status,omitempty"`
-	IsPeakPriced bool     `json:"is_peak_priced"`
+	IsPeakPriced bool     `json:"is_peak_priced,omitempty"`
 }
 
 // ---------------------------------------------------------------------------

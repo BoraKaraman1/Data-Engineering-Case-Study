@@ -2,6 +2,7 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"chargesquare/processor/transform"
 )
@@ -36,8 +37,13 @@ func validMeterUpdate() transform.Event {
 }
 
 func TestValidateAcceptsGoodEvent(t *testing.T) {
-	if verr := Validate(validMeterUpdate(), testRegistry()); verr != nil {
+	ts, verr := Validate(validMeterUpdate(), testRegistry())
+	if verr != nil {
 		t.Fatalf("expected valid, got %v", verr)
+	}
+	want, _ := time.Parse(time.RFC3339, "2026-07-01T09:59:00.000Z")
+	if !ts.Equal(want) {
+		t.Fatalf("expected parsed timestamp %v, got %v", want, ts)
 	}
 }
 
@@ -67,7 +73,7 @@ func TestValidateRules(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			e := validMeterUpdate()
 			c.mut(&e)
-			verr := Validate(e, reg)
+			_, verr := Validate(e, reg)
 			if verr == nil {
 				t.Fatalf("expected rule %q, got nil", c.rule)
 			}
@@ -84,7 +90,7 @@ func TestHeartbeatConnectorMustBeZero(t *testing.T) {
 		Timestamp: "2026-07-01T09:59:00.000Z", OperatorID: "ChargeSquare",
 		Location: transform.Location{Lat: 41, Lon: 29, City: "Istanbul", Country: "TR"},
 	}
-	verr := Validate(e, testRegistry())
+	_, verr := Validate(e, testRegistry())
 	if verr == nil || verr.Rule != "bad_connector" {
 		t.Fatalf("expected bad_connector, got %v", verr)
 	}
@@ -99,7 +105,7 @@ func TestValidateReferential(t *testing.T) {
 	reg := testRegistry()
 
 	// Exact match on every referential field (what the simulator emits) -> valid.
-	if verr := Validate(validMeterUpdate(), reg); verr != nil {
+	if _, verr := Validate(validMeterUpdate(), reg); verr != nil {
 		t.Fatalf("expected referential match to pass, got %v", verr)
 	}
 
@@ -107,7 +113,7 @@ func TestValidateReferential(t *testing.T) {
 	near := validMeterUpdate()
 	near.Location.Lat = 41 + 5e-5
 	near.Location.Lon = 29 - 5e-5
-	if verr := Validate(near, reg); verr != nil {
+	if _, verr := Validate(near, reg); verr != nil {
 		t.Fatalf("expected within-epsilon geo to pass, got %v", verr)
 	}
 
@@ -125,7 +131,7 @@ func TestValidateReferential(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			e := validMeterUpdate()
 			c.mut(&e)
-			verr := Validate(e, reg)
+			_, verr := Validate(e, reg)
 			if verr == nil {
 				t.Fatalf("expected rule %q, got nil", c.rule)
 			}

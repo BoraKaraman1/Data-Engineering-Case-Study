@@ -51,123 +51,127 @@ func Decode(raw []byte) (transform.Event, *ValidationError) {
 // Validate enforces schema + referential rules. First failure wins; the returned rule
 // drives processor_validation_errors_total{rule} and the dead-letter record. The rules
 // are aligned to exactly what the simulator emits per type, so they reject corrupt rows
-// without false-positiving on well-formed ones.
-func Validate(e transform.Event, reg *Registry) *ValidationError {
+// without false-positiving on well-formed ones. On success it also returns the parsed
+// event timestamp, so hot-path callers never re-parse the string it already parsed.
+func Validate(e transform.Event, reg *Registry) (time.Time, *ValidationError) {
 	if e.EventID == "" {
-		return verr("missing_event_id", "missing event_id")
+		return time.Time{}, verr("missing_event_id", "missing event_id")
 	}
 	if !isValidEventID(e.EventID) {
-		return verr("bad_event_id", "malformed event_id %q", e.EventID)
+		return time.Time{}, verr("bad_event_id", "malformed event_id %q", e.EventID)
 	}
 	if !validEventTypes[e.EventType] {
-		return verr("unknown_event_type", "unknown event_type %q", e.EventType)
+		return time.Time{}, verr("unknown_event_type", "unknown event_type %q", e.EventType)
 	}
-	numConn, ok := reg.Station(e.StationID)
+	// ONE snapshot read serves both the referential cross-check and the connector-range
+	// check below. Two separate reads could straddle a concurrent Refresh swap and judge
+	// the event against two different rosters (e.g. mislabel a removed station as an
+	// operator_mismatch instead of unknown_station).
+	meta, ok := reg.StationMeta(e.StationID)
 	if !ok {
-		return verr("unknown_station", "unknown station_id %q", e.StationID)
+		return time.Time{}, verr("unknown_station", "unknown station_id %q", e.StationID)
 	}
-	if _, err := time.Parse(time.RFC3339, e.Timestamp); err != nil {
-		return verr("bad_timestamp", "unparseable timestamp %q", e.Timestamp)
+	ts, err := time.Parse(time.RFC3339, e.Timestamp)
+	if err != nil {
+		return time.Time{}, verr("bad_timestamp", "unparseable timestamp %q", e.Timestamp)
 	}
 	if e.OperatorID == "" {
-		return verr("missing_operator", "missing operator_id")
+		return time.Time{}, verr("missing_operator", "missing operator_id")
 	}
 	if e.Location.City == "" || e.Location.Country == "" {
-		return verr("missing_location", "missing location city/country")
+		return time.Time{}, verr("missing_location", "missing location city/country")
 	}
 	if e.Location.Lat < -90 || e.Location.Lat > 90 || e.Location.Lon < -180 || e.Location.Lon > 180 {
-		return verr("bad_geo", "lat/lon out of range")
+		return time.Time{}, verr("bad_geo", "lat/lon out of range")
 	}
 
 	// Referential cross-check against the seeded station: a well-formed event that names a
 	// real station but the wrong operator/city/country/coords is corrupt (or misrouted) and
 	// would pollute analytics grouped by operator/city, so reject it. Runs after the
 	// non-empty/bounds checks above (so an empty field reports missing_*, not a mismatch).
-	// The station exists here (checked above), so the meta lookup cannot miss. Strings are
-	// matched exactly; coordinates within a generous epsilon (float round-trip through
-	// Postgres+JSON), since the simulator emits exactly the seeded station coords.
-	meta, _ := reg.StationMeta(e.StationID)
+	// Strings are matched exactly; coordinates within a generous epsilon (float round-trip
+	// through Postgres+JSON), since the simulator emits exactly the seeded station coords.
 	if e.OperatorID != meta.operatorID {
-		return verr("operator_mismatch", "operator_id %q does not match station operator %q", e.OperatorID, meta.operatorID)
+		return time.Time{}, verr("operator_mismatch", "operator_id %q does not match station operator %q", e.OperatorID, meta.operatorID)
 	}
 	if e.Location.City != meta.city {
-		return verr("city_mismatch", "city %q does not match station city %q", e.Location.City, meta.city)
+		return time.Time{}, verr("city_mismatch", "city %q does not match station city %q", e.Location.City, meta.city)
 	}
 	if e.Location.Country != meta.country {
-		return verr("country_mismatch", "country %q does not match station country %q", e.Location.Country, meta.country)
+		return time.Time{}, verr("country_mismatch", "country %q does not match station country %q", e.Location.Country, meta.country)
 	}
 	if math.Abs(e.Location.Lat-meta.lat) > 1e-4 || math.Abs(e.Location.Lon-meta.lon) > 1e-4 {
-		return verr("geo_mismatch", "lat/lon (%v,%v) does not match station (%v,%v)", e.Location.Lat, e.Location.Lon, meta.lat, meta.lon)
+		return time.Time{}, verr("geo_mismatch", "lat/lon (%v,%v) does not match station (%v,%v)", e.Location.Lat, e.Location.Lon, meta.lat, meta.lon)
 	}
 
 	// HEARTBEAT is station-level (connector 0); everything else must name a real
-	// connector on that station (1..numConn), which also keeps the UInt8 cast safe.
+	// connector on that station (1..numConnectors), which also keeps the UInt8 cast safe.
 	if e.EventType == "HEARTBEAT" {
 		if e.ConnectorID != 0 {
-			return verr("bad_connector", "HEARTBEAT connector_id must be 0, got %d", e.ConnectorID)
+			return time.Time{}, verr("bad_connector", "HEARTBEAT connector_id must be 0, got %d", e.ConnectorID)
 		}
-	} else if e.ConnectorID < 1 || e.ConnectorID > numConn {
-		return verr("connector_out_of_range", "connector_id %d exceeds station connector count %d", e.ConnectorID, numConn)
+	} else if e.ConnectorID < 1 || e.ConnectorID > meta.numConnectors {
+		return time.Time{}, verr("connector_out_of_range", "connector_id %d exceeds station connector count %d", e.ConnectorID, meta.numConnectors)
 	}
 
 	// A tariff, whenever present, must be a real one.
 	if e.TariffID != "" && !reg.TariffKnown(e.TariffID) {
-		return verr("unknown_tariff", "unknown tariff_id %q", e.TariffID)
+		return time.Time{}, verr("unknown_tariff", "unknown tariff_id %q", e.TariffID)
 	}
 
 	switch e.EventType {
 	case "SESSION_START":
 		if e.SessionID == "" {
-			return verr("missing_session", "SESSION_START missing session_id")
+			return time.Time{}, verr("missing_session", "SESSION_START missing session_id")
 		}
 		if e.Vehicle == nil || e.Vehicle.Brand == "" {
-			return verr("missing_vehicle", "SESSION_START missing vehicle brand")
+			return time.Time{}, verr("missing_vehicle", "SESSION_START missing vehicle brand")
 		}
 		if e.TariffID == "" {
-			return verr("missing_tariff", "SESSION_START missing tariff_id")
+			return time.Time{}, verr("missing_tariff", "SESSION_START missing tariff_id")
 		}
 		if e.Meter == nil {
-			return verr("missing_meter", "SESSION_START missing meter")
+			return time.Time{}, verr("missing_meter", "SESSION_START missing meter")
 		}
 	case "METER_UPDATE":
 		if e.SessionID == "" {
-			return verr("missing_session", "METER_UPDATE missing session_id")
+			return time.Time{}, verr("missing_session", "METER_UPDATE missing session_id")
 		}
 		if e.TariffID == "" {
-			return verr("missing_tariff", "METER_UPDATE missing tariff_id")
+			return time.Time{}, verr("missing_tariff", "METER_UPDATE missing tariff_id")
 		}
 		if e.Meter == nil {
-			return verr("missing_meter", "METER_UPDATE missing meter")
+			return time.Time{}, verr("missing_meter", "METER_UPDATE missing meter")
 		}
 	case "SESSION_STOP":
 		if e.SessionID == "" {
-			return verr("missing_session", "SESSION_STOP missing session_id")
+			return time.Time{}, verr("missing_session", "SESSION_STOP missing session_id")
 		}
 		if e.TariffID == "" {
-			return verr("missing_tariff", "SESSION_STOP missing tariff_id")
+			return time.Time{}, verr("missing_tariff", "SESSION_STOP missing tariff_id")
 		}
 		if e.Meter == nil {
-			return verr("missing_meter", "SESSION_STOP missing meter")
+			return time.Time{}, verr("missing_meter", "SESSION_STOP missing meter")
 		}
 		if e.CostEur < 0 {
-			return verr("bad_cost", "negative cost_eur %v", e.CostEur)
+			return time.Time{}, verr("bad_cost", "negative cost_eur %v", e.CostEur)
 		}
 	case "STATUS_CHANGE":
 		if !validStatuses[e.Status] {
-			return verr("bad_status", "invalid status %q", e.Status)
+			return time.Time{}, verr("bad_status", "invalid status %q", e.Status)
 		}
 	case "FAULT_ALERT":
 		if e.Fault == nil || e.Fault.ErrorCode == "" {
-			return verr("missing_fault", "FAULT_ALERT missing fault error_code")
+			return time.Time{}, verr("missing_fault", "FAULT_ALERT missing fault error_code")
 		}
 	}
 
 	if e.Meter != nil {
-		if err := validateMeter(e.Meter); err != nil {
-			return err
+		if merr := validateMeter(e.Meter); merr != nil {
+			return time.Time{}, merr
 		}
 	}
-	return nil
+	return ts, nil
 }
 
 // isValidEventID reports whether s is a canonical hyphenated UUID: 36 characters, hyphens

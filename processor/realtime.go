@@ -43,13 +43,10 @@ func (h *realtimeHandler) applyBatch(ctx context.Context, batch []kafka.Message)
 			continue // best-effort; the analytics path dead-letters it
 		}
 		h.m.Consumed.WithLabelValues("realtime", e.EventType).Inc()
-		if verr := Validate(e, h.reg); verr != nil {
+		ts, verr := Validate(e, h.reg)
+		if verr != nil {
 			h.m.RealtimeInvalidSkipped.Inc()
 			continue
-		}
-		ts, terr := time.Parse(time.RFC3339, e.Timestamp)
-		if terr != nil {
-			continue // already validated as parseable; stay safe
 		}
 		events = append(events, stateEvent{e: e, ts: ts, produced: batch[i].Time})
 	}

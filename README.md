@@ -261,6 +261,24 @@ with the on-demand `ev_analytics_daily` DAG (freshness gate, per-partition
 OPTIMIZE, exact revenue reconciliation, PSI data-quality gate, TTL report). It is
 not started by the default stack. See [deploy/airflow/README.md](deploy/airflow/README.md).
 
+**Login:** username `admin`; `airflow standalone` generates a random password on
+first boot. Read it with:
+
+```bash
+docker compose exec airflow cat /opt/airflow/standalone_admin_password.txt
+```
+
+(it is also printed in the container log: `docker compose logs airflow | grep -i password`).
+
+**Why a batch layer at all:** the streaming path answers "what is happening now",
+but some correctness work is inherently scheduled and whole-partition, not
+per-event — compacting closed partitions, re-computing yesterday's revenue
+*exactly* to correct the approximate streaming rollup, drift/data-quality gates,
+retention enforcement. In production an orchestrator gives that work what cron
+cannot: task dependencies with retries, backfills for late-arriving corrections,
+SLA alerting, and an auditable per-task run history. It runs beside the stream,
+never on it — the hot ingest path stays clear.
+
 ---
 
 ## Repo layout
